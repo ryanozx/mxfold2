@@ -14,8 +14,8 @@ class MixedFold(AbstractFold):
 
     def forward(self, seq, return_param=False, param=None, return_partfunc=False,
             max_internal_length=30, constraint=None, reference=None,
-            loss_pos_paired=0.0, loss_neg_paired=0.0, loss_pos_unpaired=0.0, loss_neg_unpaired=0.0):
-        param = self.make_param(seq) if param is None else param # reuse param or not
+            loss_pos_paired=0.0, loss_neg_paired=0.0, loss_pos_unpaired=0.0, loss_neg_unpaired=0.0, **kwargs):
+        param = self.make_param(seq, **kwargs) if param is None else param # reuse param or not
         ss = []
         preds = []
         pairs = []
@@ -62,7 +62,7 @@ class MixedFold(AbstractFold):
             return ss, preds, pairs
 
 
-    def make_param(self, seq):
+    def make_param(self, seq, **kwargs):
         ts = self.turner.make_param(seq)
-        ps = self.zuker.make_param(seq)
+        ps = self.zuker.make_param(seq, **kwargs)
         return [{'turner': t, 'positional': p} for t, p in zip(ts, ps)]

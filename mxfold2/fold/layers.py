@@ -60,7 +60,7 @@ class CNNLSTMEncoder(nn.Module):
             self.att = nn.MultiheadAttention(self.n_out, num_att, dropout=dropout_rate)
 
 
-    def forward(self, x): # (B, n_in, N)
+    def forward(self, x, **kwargs): # (B, n_in, N)
         if self.conv is not None:
             x = self.conv(x) # (B, C, N)
         x = torch.transpose(x, 1, 2) # (B, N, C)
@@ -275,10 +275,10 @@ class NeuralNet(nn.Module):
             self.linear = nn.Linear(n_in, n_out_unpaired_layers)
 
 
-    def forward(self, seq):
+    def forward(self, seq, **kwargs):
         device = next(self.parameters()).device
         x = self.embedding(['0' + s for s in seq]).to(device) # (B, 4, N)
-        x = self.encoder(x)
+        x = self.encoder(x, **kwargs)
 
         if self.no_split_lr:
             x_l, x_r = x, x

@@ -23,29 +23,34 @@ class StructuredLoss(nn.Module):
                                 loss_pos_unpaired=self.loss_pos_unpaired, loss_neg_unpaired=self.loss_neg_unpaired)
         ref, ref_s, _ = self.model(seq, param=param, constraint=pairs, max_internal_length=None)
         l = torch.tensor([len(s) for s in seq], device=pred.device)
-        loss = (pred - ref) / l
+        margin_loss = (pred - ref) / l
+        sl_loss = torch.zeros_like(margin_loss)
+        loss = margin_loss + sl_loss
         if self.verbose:
             print("Loss = {} = ({} - {})".format(loss.item(), pred.item(), ref.item()))
             print(seq)
             print(pred_s)
             print(ref_s)
-        if loss.item()> 1e10 or torch.isnan(loss):
+        if loss.item()> 1e10 or torch.isnan(loss).any():
             print()
             print(fname)
             print(loss.item(), pred.item(), ref.item())
             print(seq)
 
+        l1_loss = torch.zeros_like(margin_loss)
+        
         if self.l1_weight > 0.0:
             for p in self.model.parameters():
-                loss += self.l1_weight * torch.sum(torch.abs(p))
+                l1_loss += self.l1_weight * torch.sum(torch.abs(p))
 
         # if self.l2_weight > 0.0:
-        #     l2_reg = 0.0
+        #     l2_reg = torch.zeros_like(margin_loss)
         #     for p in self.model.parameters():
-        #         l2_reg += torch.sum((self.l2_weight * p) ** 2)
-        #     loss += torch.sqrt(l2_reg)
+        #         l2_reg += torch.sum(p ** 2)
+        #     l2_loss += self.l2_weight * torch.sqrt(l2_reg)
 
-        return loss
+        loss += l1_loss
+        return loss, margin_loss, sl_loss, l1_loss
 
 
 class StructuredLossWithTurner(nn.Module):
@@ -77,27 +82,33 @@ class StructuredLossWithTurner(nn.Module):
         with torch.no_grad():
             ref2, ref2_s, _ = self.turner(seq, constraint=pairs, max_internal_length=None)
         l = torch.tensor([len(s) for s in seq], device=pred.device)
-        loss = (pred - ref) / l
-        loss += self.sl_weight * (ref-ref2) * (ref-ref2) / l
+        margin_loss = (pred - ref) / l  
+        sl_loss = self.sl_weight * (ref-ref2) * (ref-ref2) / l
+
+        loss = margin_loss + sl_loss
+
         if self.verbose:
             print("Loss = {} = ({} - {})".format(loss.item(), pred.item(), ref.item()))
             print(seq)
             print(pred_s)
             print(ref_s)
-        if loss.item()> 1e10 or torch.isnan(loss):
+        if loss.item()> 1e10 or torch.isnan(loss).any():
             print()
             print(fname)
             print(loss.item(), pred.item(), ref.item())
             print(seq)
 
+        l1_loss = torch.zeros_like(margin_loss)
+
         if self.l1_weight > 0.0:
             for p in self.model.parameters():
-                loss += self.l1_weight * torch.sum(torch.abs(p))
+                l1_loss += self.l1_weight * torch.sum(torch.abs(p))
 
         # if self.l2_weight > 0.0:
-        #     l2_reg = 0.0
+        #     l2_reg = torch.zeros_like(margin_loss)
         #     for p in self.model.parameters():
-        #         l2_reg += torch.sum((self.l2_weight * p) ** 2)
-        #     loss += torch.sqrt(l2_reg)
+        #         l2_reg += torch.sum(p ** 2)
+        #     l2_loss += self.l2_weight * torch.sqrt(l2_reg)
 
-        return loss
+        loss += l1_loss
+        return loss, margin_loss, sl_loss, l1_loss

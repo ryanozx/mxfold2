@@ -35,7 +35,7 @@ class Train:
         self.model.train()
         n_dataset = len(self.train_loader.dataset)
         loss_total, num = 0, 0
-        running_loss, n_running_loss = 0, 0
+        running_loss, running_margin_loss, running_sl_loss, running_l1_loss, n_running_loss = 0, 0, 0, 0, 0
         start = time.time()
         with tqdm(total=n_dataset, disable=self.disable_progress_bar) as pbar:
             for fnames, seqs, pairs in self.train_loader:
@@ -45,7 +45,11 @@ class Train:
                     self.step += 1
                 n_batch = len(seqs)
                 self.optimizer.zero_grad()
-                loss = torch.sum(self.loss_fn(seqs, pairs, fname=fnames))
+                loss, margin_loss, sl_loss, l1_loss = self.loss_fn(seqs, pairs, fname=fnames)
+                loss = loss.sum()
+                margin_loss = margin_loss.sum()
+                sl_loss = sl_loss.sum()
+                l1_loss = l1_loss.sum()
                 loss_total += loss.item()
                 num += n_batch
                 if loss.item() > 0.:
@@ -59,16 +63,28 @@ class Train:
                 pbar.update(n_batch)
 
                 running_loss += loss.item()
+                running_margin_loss += margin_loss.item()
+                running_sl_loss += sl_loss.item()
+                running_l1_loss += l1_loss.item()
                 n_running_loss += n_batch
                 if n_running_loss >= 100 or num >= n_dataset:
                     running_loss /= n_running_loss
+                    running_margin_loss /= n_running_loss
+                    running_sl_loss /= n_running_loss
+                    running_l1_loss /= n_running_loss
                     if self.writer is not None:
-                        self.writer.add_scalar("train/loss", running_loss, (epoch-1) * n_dataset + num)
-                    running_loss, n_running_loss = 0, 0
+                        step = (epoch-1) * n_dataset + num
+                        self.writer.add_scalar("train/loss", running_loss, step)
+                        self.writer.add_scalar("train/margin_loss", running_margin_loss, step)
+                        self.writer.add_scalar("train/sl_loss", running_sl_loss, step)
+                        self.writer.add_scalar("train/l1_loss", running_l1_loss, step)
+                    running_loss, running_margin_loss, running_sl_loss, running_l1_loss, n_running_loss = 0, 0, 0, 0, 0
         elapsed_time = time.time() - start
         if self.verbose:
             print()
         print('Train Epoch: {}\tLoss: {:.6f}\tTime: {:.3f}s'.format(epoch, loss_total / num, elapsed_time))
+        if self.writer is not None:
+            self.writer.flush()
 
 
     def test(self, epoch):
@@ -79,7 +95,7 @@ class Train:
         with torch.no_grad(), tqdm(total=n_dataset, disable=self.disable_progress_bar) as pbar:
             for fnames, seqs, pairs in self.test_loader:
                 n_batch = len(seqs)
-                loss = self.loss_fn(seqs, pairs, fname=fnames)
+                loss, _, _, _ = self.loss_fn(seqs, pairs, fname=fnames)
                 loss_total += loss.item()
                 num += n_batch
                 pbar.set_postfix(test_loss='{:.3e}'.format(loss_total / num))
@@ -87,8 +103,10 @@ class Train:
 
         elapsed_time = time.time() - start
         if self.writer is not None:
-            self.writer.add_scalar("test/loss", epoch * n_dataset, loss_total / num)
+            self.writer.add_scalar("test/loss", loss_total / num, epoch * n_dataset)
         print('Test Epoch: {}\tLoss: {:.6f}\tTime: {:.3f}s'.format(epoch, loss_total / num, elapsed_time))
+        if self.writer is not None:
+            self.writer.flush()
 
 
     def save_checkpoint(self, outdir, epoch):
@@ -256,6 +274,9 @@ class Train:
             torch.save(self.model.state_dict(), args.param)
         if args.save_config is not None:
             self.save_config(args.save_config, config)
+        
+        if self.writer is not None:
+            self.writer.close()
 
         return self.model
 

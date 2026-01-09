@@ -14,6 +14,7 @@ from .dataset import BPseqDataset, FastaDataset
 from .fold.mix import MixedFold
 from .fold.rnafold import RNAFold
 from .fold.zuker import ZukerFold
+from .fold.layers import TransformerLayer
 
 
 class Predict:
@@ -21,24 +22,45 @@ class Predict:
         self.test_loader = None
 
 
-    def predict(self, output_bpseq=None, output_bpp=None, result=None, use_constraint=False):
+    def predict(self, output_bpseq=None, output_bpp=None, result=None, use_constraint=False, output_attn_dir=None):
         res_fn = open(result, 'w') if result is not None else None
         self.model.eval()
+        if output_attn_dir is not None:
+            os.makedirs(output_attn_dir, exist_ok = True)
+            print("will return attn weights")
         with torch.no_grad():
+            return_attn_weights = output_attn_dir is not None
             for headers, seqs, refs in self.test_loader:
                 start = time.time()
                 if output_bpp is None:
                     if use_constraint:
-                        scs, preds, bps = self.model(seqs, constraint=refs)
+                        scs, preds, bps = self.model(seqs, constraint=refs, return_attn_weights=return_attn_weights)
                     else:
-                        scs, preds, bps = self.model(seqs)
+                        scs, preds, bps = self.model(seqs, return_attn_weights=return_attn_weights)
                     pfs = bpps = [None] * len(preds)
                 else:
                     if use_constraint:
-                        scs, preds, bps, pfs, bpps = self.model(seqs, return_partfunc=True, constraint=refs)
+                        scs, preds, bps, pfs, bpps = self.model(seqs, return_partfunc=True, constraint=refs, return_attn_weights=return_attn_weights)
                     else:
-                        scs, preds, bps, pfs, bpps = self.model(seqs, return_partfunc=True, )
+                        scs, preds, bps, pfs, bpps = self.model(seqs, return_partfunc=True, return_attn_weights=return_attn_weights)
                 elapsed_time = time.time() - start
+
+                # retrieve attention maps if produced
+                batch_attn = None
+                encoder = None
+                if return_attn_weights:
+                    if isinstance(self.model, ZukerFold):
+                        net = getattr(self.model, "net", None)
+                        encoder = getattr(net, "encoder", None)
+                    elif isinstance(self.model, MixedFold):
+                        zuker = getattr(self.model, "zuker", None)
+                        net = getattr(zuker, "net", None)
+                        encoder = getattr(net, "encoder", None)
+                    
+                    if encoder is not None and hasattr(encoder, '_attn_maps'):
+                        batch_attn = encoder._attn_maps
+
+
                 for header, seq, ref, sc, pred, bp, pf, bpp in zip(headers, seqs, refs, scs, preds, bps, pfs, bpps):
                     if output_bpseq is None:
                         print('>'+header)
@@ -67,6 +89,22 @@ class Predict:
                         fn = os.path.splitext(fn)[0] 
                         fn = os.path.join(output_bpp, fn+".bpp")
                         np.savetxt(fn, bpp, fmt='%.5f')
+
+                    if return_attn_weights and batch_attn is not None:
+                        save_maps = [attn_map.detach().cpu() if attn_map is not None else None for attn_map in batch_attn]
+                        
+                        fn_base = os.path.splitext(os.path.basename(header))[0]
+                        torch.save(save_maps, os.path.join(output_attn_dir, f"{fn_base}.attn.pt"))
+                
+                if return_attn_weights and 'encoder' in locals() and encoder is not None:
+                    if isinstance(encoder, TransformerLayer):
+                        for layer in encoder.layers:
+                            layer._attn_weights = None
+                    
+                    if hasattr(encoder, "_attn_maps"):
+                        encoder._attn_maps = None
+
+
 
 
     def build_model(self, args):
@@ -148,7 +186,8 @@ class Predict:
         if args.gpu >= 0:
             self.model.to(torch.device("cuda", args.gpu))
 
-        self.predict(output_bpseq=args.bpseq, output_bpp=args.bpp, result=args.result, use_constraint=args.use_constraint)
+        output_attn_dir = args.output_attn_dir
+        self.predict(output_bpseq=args.bpseq, output_bpp=args.bpp, result=args.result, use_constraint=args.use_constraint, output_attn_dir=output_attn_dir)
 
 
     @classmethod
@@ -171,6 +210,9 @@ class Predict:
                             help='output the prediction with BPSEQ format to the specified directory')
         subparser.add_argument('--bpp', type=str, default=None,
                             help='output the base-pairing probability matrix to the specified directory')
+        subparser.add_argument('--output-attn-dir', type=str, default=None, 
+                               help='directory to save per-layer attention maps (torch.pt) during prediction')
+
 
         gparser = subparser.add_argument_group("Network setting")
         gparser.add_argument('--model', choices=('Turner', 'Zuker', 'ZukerS', 'ZukerL', 'ZukerC', 'Mix', 'MixC'), default='Turner', 
