@@ -23,11 +23,12 @@ class Fold
             size_t min_hairpin;
             size_t max_internal;
             size_t max_helix;
-            std::vector<u_int32_t> stru;
-            std::vector<std::pair<u_int32_t, u_int32_t>> stru2;
+            // per-position constraint specification using 1-based indexing
+            std::vector<uint32_t> constraint_spec;
+            std::vector<std::pair<uint32_t, uint32_t>> constraint_pair_candidates;
             bool use_penalty;
-            std::vector<u_int32_t> ref;
-            std::vector<std::pair<u_int32_t,u_int32_t>> ref2;
+            std::vector<uint32_t> ref;
+            std::vector<std::pair<uint32_t,uint32_t>> ref2;
             float pos_paired;
             float neg_paired;
             float pos_unpaired;
@@ -40,6 +41,8 @@ class Fold
                 use_penalty(false)
             {    
             }
+
+            // Methods to configure options
 
             Options& min_hairpin_loop_length(size_t s)
             {
@@ -59,19 +62,19 @@ class Fold
                 return *this;
             }
 
-            Options& constraints(const std::vector<u_int32_t>& s)
+            Options& constraints(const std::vector<uint32_t>& s)
             {
-                this->stru = s;
+                this->constraint_spec = s;
                 return *this;
             }
 
-            Options& constraints(const std::vector<std::pair<u_int32_t, u_int32_t>>& s)
+            Options& constraints(const std::vector<std::pair<uint32_t, uint32_t>>& s)
             {
-                this->stru2 = s;
+                this->constraint_pair_candidates = s;
                 return *this;
             }
 
-            Options& penalty(const std::vector<u_int32_t>& ref, float pos_paired=0, float neg_paired=0, float pos_unpaired=0, float neg_unpaired=0)
+            Options& penalty(const std::vector<uint32_t>& ref, float pos_paired=0, float neg_paired=0, float pos_unpaired=0, float neg_unpaired=0)
             {
                 this->use_penalty = pos_paired!=0 || neg_paired!=0 || pos_unpaired!=0 || neg_unpaired!=0;
                 this->ref = ref;
@@ -82,7 +85,7 @@ class Fold
                 return *this;
             }
 
-            Options& penalty(const std::vector<std::pair<u_int32_t, u_int32_t>>& ref2, 
+            Options& penalty(const std::vector<std::pair<uint32_t, uint32_t>>& ref2, 
                         float pos_paired=0, float neg_paired=0, float pos_unpaired=0, float neg_unpaired=0)
             {
                 this->use_penalty = pos_paired!=0 || neg_paired!=0 || pos_unpaired!=0 || neg_unpaired!=0;
@@ -103,6 +106,6 @@ class Fold
     public:
         static bool allow_paired(char x, char y);
         static auto parse_paren(const std::string& paren) 
-            -> std::vector<u_int32_t>;
-        static auto make_paren(const std::vector<u_int32_t>& p) -> std::string;
+            -> std::vector<uint32_t>;
+        static auto make_paren(const std::vector<uint32_t>& p) -> std::string;
 };

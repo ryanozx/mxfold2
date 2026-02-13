@@ -2,6 +2,24 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass
+
+@dataclass
+class Loss:
+    # Assumption: Batch size = 1
+    loss: torch.Tensor
+    pred_score: torch.Tensor
+    ref_score: torch.Tensor
+    margin_loss: torch.Tensor
+    score_loss: torch.Tensor
+    l1_loss: torch.Tensor
+
+    def __str__(self):
+        return f"Loss = {self.loss.item():.6g}  \
+        Energy Gap = {self.pred_score.item() - self.ref_score.item():.6g} \
+        Margin Loss = {self.margin_loss.item():.6g} \
+        Score Loss = {self.score_loss.item():.6g} \
+        L1 Loss = {self.l1_loss.item():.6g}"
 
 class StructuredLoss(nn.Module):
     def __init__(self, model, loss_pos_paired=0, loss_neg_paired=0, loss_pos_unpaired=0, loss_neg_unpaired=0, 
@@ -17,7 +35,7 @@ class StructuredLoss(nn.Module):
         self.verbose = verbose
 
 
-    def forward(self, seq, pairs, fname=None):
+    def forward(self, seq, pairs, fname=None) -> Loss:
         pred, pred_s, _, param = self.model(seq, return_param=True, reference=pairs,
                                 loss_pos_paired=self.loss_pos_paired, loss_neg_paired=self.loss_neg_paired, 
                                 loss_pos_unpaired=self.loss_pos_unpaired, loss_neg_unpaired=self.loss_neg_unpaired)
@@ -50,7 +68,11 @@ class StructuredLoss(nn.Module):
         #     l2_loss += self.l2_weight * torch.sqrt(l2_reg)
 
         loss += l1_loss
-        return loss, margin_loss, sl_loss, l1_loss
+        return Loss(loss = loss, 
+                    margin_loss = margin_loss, 
+                    pred_score = pred, ref_score = ref,
+                    score_loss = sl_loss, 
+                    l1_loss = l1_loss)
 
 
 class StructuredLossWithTurner(nn.Module):
@@ -74,7 +96,7 @@ class StructuredLossWithTurner(nn.Module):
             self.turner = RNAFold(param_turner2004).to(next(self.model.parameters()).device)
 
 
-    def forward(self, seq, pairs, fname=None):
+    def forward(self, seq, pairs, fname=None) -> Loss:
         pred, pred_s, _, param = self.model(seq, return_param=True, reference=pairs,
                                 loss_pos_paired=self.loss_pos_paired, loss_neg_paired=self.loss_neg_paired, 
                                 loss_pos_unpaired=self.loss_pos_unpaired, loss_neg_unpaired=self.loss_neg_unpaired)
@@ -111,4 +133,11 @@ class StructuredLossWithTurner(nn.Module):
         #     l2_loss += self.l2_weight * torch.sqrt(l2_reg)
 
         loss += l1_loss
-        return loss, margin_loss, sl_loss, l1_loss
+        return Loss(
+            loss = loss,
+            margin_loss = margin_loss,
+            pred_score = pred,
+            ref_score = ref,
+            score_loss = sl_loss,
+            l1_loss = l1_loss
+        )

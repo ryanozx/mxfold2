@@ -27,7 +27,7 @@ compute_viterbi(const std::string& seq, Options opts /*= Options()*/) -> ScoreTy
     const auto [allow_paired, allow_unpaired] = opts.make_constraint(seq);
     const auto [loss_paired, loss_unpaired, loss_const] = opts.make_penalty(L);
 
-    std::vector<std::vector<u_int32_t>> split_point_l(L+1);
+    std::vector<std::vector<uint32_t>> split_point_l(L+1);
 
     for (auto i=L; i>=1; i--)
     {
@@ -90,11 +90,11 @@ compute_viterbi(const std::string& seq, Options opts /*= Options()*/) -> ScoreTy
 template < typename P, typename S >
 auto
 Nussinov<P, S>::
-traceback_viterbi() -> std::vector<u_int32_t>
+traceback_viterbi() -> std::vector<uint32_t>
 {
     const auto L = Dt_.size()-1;
-    std::vector<u_int32_t> pair(L+1, 0);
-    std::queue<std::tuple<TB, u_int32_t, u_int32_t>> tb_queue;
+    std::vector<uint32_t> pair(L+1, 0);
+    std::queue<std::tuple<TB, uint32_t, uint32_t>> tb_queue;
     tb_queue.emplace(Dt_[1][L], 1, L);
 
     while (!tb_queue.empty())
@@ -138,12 +138,12 @@ traceback_viterbi() -> std::vector<u_int32_t>
 template < typename P, typename S >
 auto
 Nussinov<P, S>::
-traceback_viterbi(const std::string& seq, Options opts /*= Options()*/) -> std::pair<typename P::ScoreType, std::vector<u_int32_t>>
+traceback_viterbi(const std::string& seq, Options opts /*= Options()*/) -> std::pair<typename P::ScoreType, std::vector<uint32_t>>
 {
     const auto L = Dt_.size()-1;
-    std::vector<u_int32_t> pair(L+1, 0);
+    std::vector<uint32_t> pair(L+1, 0);
     const auto [loss_paired, loss_unpaired, loss_const] = opts.make_penalty(L);
-    std::queue<std::tuple<TB, u_int32_t, u_int32_t>> tb_queue;
+    std::queue<std::tuple<TB, uint32_t, uint32_t>> tb_queue;
     tb_queue.emplace(Dt_[1][L], 1, L);
     auto e = 0.;
 
@@ -210,8 +210,8 @@ class SimpleNussinovScore
                         score_paired_[i][j] = -1.;
         }
 
-        ScoreType score_paired(u_int32_t i, u_int32_t j) const { return score_paired_[i][j]; }
-        ScoreType score_unpaired(u_int32_t i) const { return score_unpaired_[i]; }
+        ScoreType score_paired(uint32_t i, uint32_t j) const { return score_paired_[i][j]; }
+        ScoreType score_unpaired(uint32_t i) const { return score_unpaired_[i]; }
 
 
     private:

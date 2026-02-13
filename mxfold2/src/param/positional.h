@@ -77,12 +77,12 @@ class PositionalNearestNeighbor
         CountType<1> count_helix_length_;
 
     public:
-        const u_int32_t MAX_HAIRPIN_LENGTH;
-        const u_int32_t MAX_BULGE_LENGTH;
-        const u_int32_t MAX_INTERNAL_LENGTH;
-        const u_int32_t MAX_SINGLE_LENGTH;
-        const u_int32_t MAX_INTERNAL_SYMMETRIC_LENGTH;
-        const u_int32_t MAX_INTERNAL_ASYMMETRY;
-        const u_int32_t MAX_INTERNAL_EXPLICIT_LENGTH;
-        const u_int32_t MAX_HELIX_LENGTH;
+        const uint32_t MAX_HAIRPIN_LENGTH;
+        const uint32_t MAX_BULGE_LENGTH;
+        const uint32_t MAX_INTERNAL_LENGTH;
+        const uint32_t MAX_SINGLE_LENGTH;
+        const uint32_t MAX_INTERNAL_SYMMETRIC_LENGTH;
+        const uint32_t MAX_INTERNAL_ASYMMETRY;
+        const uint32_t MAX_INTERNAL_EXPLICIT_LENGTH;
+        const uint32_t MAX_HELIX_LENGTH;
 };

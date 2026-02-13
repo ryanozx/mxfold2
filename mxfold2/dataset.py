@@ -32,15 +32,21 @@ class FastaDataset(Dataset):
 
 
 class BPseqDataset(Dataset):
+    """
+    Given a .lst file containing the locations of .bpseq files, BPseqDataset creates a dataset that contains
+    (filename, sequence, pairing_tensor) tuples
+    """
     def __init__(self, bpseq_list):
         self.data = []
-        with open(bpseq_list) as f:
-            for l in f:
-                l = l.rstrip('\n').split()
-                if len(l)==1:
-                    self.data.append(self.read(l[0]))
-                elif len(l)==2:
-                    self.data.append(self.read_pdb(l[0], l[1]))
+        with open(bpseq_list) as list_file:
+            for file_entry in list_file:
+                file_entry = file_entry.rstrip('\n').split()
+                if len(file_entry) == 1:
+                    bpseq_file_path = file_entry[0]
+                    self.data.append(self.read(bpseq_file_path))
+                elif len(file_entry) == 2:
+                    fasta_file_path, label_file_path = file_entry
+                    self.data.append(self.read_pdb(fasta_file_path, label_file_path))
 
     def __len__(self):
         return len(self.data)
@@ -49,41 +55,48 @@ class BPseqDataset(Dataset):
         return self.data[idx]
 
     def read(self, filename):
-        with open(filename) as f:
-            structure_is_known = True
-            p = [0]
-            s = ['']
-            for l in f:
-                if not l.startswith('#'):
-                    l = l.rstrip('\n').split()
-                    if len(l) == 3:
-                        if not structure_is_known:
-                            raise('invalid format: {}'.format(filename))
-                        idx, c, pair = l
-                        pos = 'x.<>|'.find(pair)
-                        if pos >= 0:
-                            idx, pair = int(idx), -pos
-                        else:
-                            idx, pair = int(idx), int(pair)
-                        s.append(c)
-                        p.append(pair)
-                    elif len(l) == 4:
-                        structure_is_known = False
-                        idx, c, nll_unpaired, nll_paired = l
-                        s.append(c)
-                        nll_unpaired = math.nan if nll_unpaired=='-' else float(nll_unpaired)
-                        nll_paired = math.nan if nll_paired=='-' else float(nll_paired)
-                        p.append([nll_unpaired, nll_paired])
-                    else:
+        with open(filename) as bpseq_file:
+            is_structure_known = True
+            base_pairs = [0]
+            bases = ['']
+            for line in bpseq_file:
+                if line.startswith('#'):
+                    # skip comment lines
+                    continue
+
+                line = line.rstrip('\n').split()
+
+                if len(line) == 3:
+                    # each nucleotide is represented by a line in the bpseq file, with the format <position> <base> <pairing partner (0 if none)>
+                    if not is_structure_known:
                         raise('invalid format: {}'.format(filename))
+                    idx, base, pair = line
+                    # if the pair is a special symbol, we map them to a negative value
+                    pos = 'x.<>|'.find(pair)
+                    if pos >= 0:
+                        idx, pair = int(idx), -pos
+                    else:
+                        idx, pair = int(idx), int(pair)
+                    bases.append(base)
+                    base_pairs.append(pair)
+                elif len(line) == 4:
+                    raise('disabled handling files with probs')
+                    is_structure_known = False
+                    idx, base, nll_unpaired, nll_paired = line
+                    bases.append(base)
+                    nll_unpaired = math.nan if nll_unpaired=='-' else float(nll_unpaired)
+                    nll_paired = math.nan if nll_paired=='-' else float(nll_paired)
+                    base_pairs.append([nll_unpaired, nll_paired])
+                else:
+                    raise('invalid format: {}'.format(filename))
         
-        if structure_is_known:
-            seq = ''.join(s)
-            return (filename, seq, torch.tensor(p))
+        if is_structure_known:
+            seq = ''.join(bases)
+            return (filename, seq, torch.tensor(base_pairs))
         else:
-            seq = ''.join(s)
-            p.pop(0)
-            return (filename, seq, torch.tensor(p))
+            seq = ''.join(bases)
+            base_pairs.pop(0)
+            return (filename, seq, torch.tensor(base_pairs))
 
     def fasta_iter(self, fasta_name):
         fh = open(fasta_name)

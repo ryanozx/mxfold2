@@ -15,7 +15,7 @@ static
 auto
 convert_constraints(py::list constraint)
 {
-    std::vector<u_int32_t> ret(constraint.size(), Fold::Options::ANY);
+    std::vector<uint32_t> ret(constraint.size(), Fold::Options::ANY);
     for (auto i=0; i!=constraint.size(); i++)
     {
         if (py::isinstance<py::str>(constraint[i]))
@@ -54,7 +54,7 @@ static
 auto
 convert_pairs(py::list pairs)
 {
-    std::vector<std::pair<u_int32_t, u_int32_t>> ret;
+    std::vector<std::pair<uint32_t, uint32_t>> ret;
     for (auto pair: pairs)
     {
         if (py::isinstance<py::list>(pair))
@@ -79,12 +79,12 @@ convert_reference(py::list reference)
     auto r = py::cast<py::list>(reference);
     if (r.size()>0 && py::isinstance<py::int_>(r[0]))
     {
-        std::vector<u_int32_t> c(r.size());
+        std::vector<uint32_t> c(r.size());
         std::transform(std::begin(r), std::end(r), std::begin(c),
-                    [](auto x) -> u_int32_t { return py::cast<py::int_>(x); });
+                    [](auto x) -> uint32_t { return py::cast<py::int_>(x); });
         return c;
     }
-    return std::vector<u_int32_t>();
+    return std::vector<uint32_t>();
 }
 
 template < class ParamClass >

@@ -18,7 +18,7 @@ Zuker(std::unique_ptr<P>&& p)
 template < typename P, typename S >
 bool
 Zuker<P, S>::
-update_max(ScoreType& max_v, ScoreType new_v, TB& max_t, TBType tt, u_int32_t k)
+update_max(ScoreType& max_v, ScoreType new_v, TB& max_t, TBType tt, uint32_t k)
 {
     static const ScoreType NEG_INF2 = std::numeric_limits<ScoreType>::lowest()/1e10;
     if (max_v < new_v && NEG_INF2 < new_v)
@@ -52,6 +52,8 @@ compute_viterbi(const std::string& seq, Options opts) -> ScoreType
 {
     const auto L = seq.size();
     const ScoreType NEG_INF = std::numeric_limits<ScoreType>::lowest();
+    // DP tables (Viterbi scores) and traceback pointers for each subproblem:
+    // C: paired interval (i,j), M/M1: multi-loop states, F: external loop.
     Cv_.clear();  Cv_.resize(L+1, NEG_INF);
     Mv_.clear();  Mv_.resize(L+1, NEG_INF);
     M1v_.clear(); M1v_.resize(L+1, NEG_INF);
@@ -71,9 +73,9 @@ compute_viterbi(const std::string& seq, Options opts) -> ScoreType
     const auto [loss_paired, loss_unpaired, loss_const] = opts.make_penalty(L);
 
 #ifdef SIMPLE_SPARSIFICATION
-    std::vector<std::vector<u_int32_t>> split_point_c_l(L+1);
-    std::vector<std::vector<u_int32_t>> split_point_c_r(L+1);
-    std::vector<std::vector<u_int32_t>> split_point_m1_l(L+1);
+    std::vector<std::vector<uint32_t>> split_point_c_l(L+1);
+    std::vector<std::vector<uint32_t>> split_point_c_r(L+1);
+    std::vector<std::vector<uint32_t>> split_point_m1_l(L+1);
 #endif
 
     for (auto i=L; i>=1; i--)
@@ -83,6 +85,7 @@ compute_viterbi(const std::string& seq, Options opts) -> ScoreType
 #ifdef HELIX_LENGTH
             if (allow_paired[i][j])
             {
+                // N: helix nucleus (hairpin/internal/multi loop) before helix extension.
                 if (allow_unpaired[i+1][j-1]) 
                 {
                     auto s = param_->score_hairpin(i, j) + loss_paired[i][j] + loss_unpaired[i+1][j-1];
@@ -119,7 +122,7 @@ compute_viterbi(const std::string& seq, Options opts) -> ScoreType
                 }
 #endif
             
-                /////
+                // E: extended helix states (used for long helix handling).
                 if (i+1 < j-1 && allow_paired[i+1][j-1]) 
                 {
                     auto s = Ev_[i+1][j-1] + param_->score_single_loop(i, j, i+1, j-1) + loss_paired[i][j];
@@ -127,7 +130,7 @@ compute_viterbi(const std::string& seq, Options opts) -> ScoreType
                 }
                 update_max(Ev_[i][j], Nv_[i][j], Et_[i][j], TBType::E_TERMINAL);
 
-                /////
+                // C: full paired interval (i,j), possibly part of a helix.
                 bool updated=false;
                 if (opts.max_helix>0)
                 {
@@ -165,6 +168,7 @@ compute_viterbi(const std::string& seq, Options opts) -> ScoreType
 #else
             if (allow_paired[i][j])
             {
+                // C: full paired interval (i,j) without helix-length model.
                 bool updated=false;
                 if (allow_unpaired[i+1][j-1]) 
                 {
@@ -209,7 +213,7 @@ compute_viterbi(const std::string& seq, Options opts) -> ScoreType
             }
 #endif
 
-            /////////////////
+            // M: multi-loop partial state for (i,j).
 #ifdef SIMPLE_SPARSIFICATION
             for (auto u: split_point_c_l[j])
             {
@@ -257,7 +261,7 @@ compute_viterbi(const std::string& seq, Options opts) -> ScoreType
                 update_max(Mv_[i][j], s, Mt_[i][j], TBType::M_UNPAIRED);
             }
 
-            /////////////////
+            // M1: rightmost branch of a multi-loop.
             bool updated=false;
             if (allow_paired[i][j])
             {
@@ -279,6 +283,7 @@ compute_viterbi(const std::string& seq, Options opts) -> ScoreType
 
     update_max(Fv_[L+1], param_->score_external_zero(), Ft_[L+1], TBType::F_START);
 
+    // F: external loop DP from the end toward the start.
     for (auto i=L; i>=1; i--)
     {
         if (allow_unpaired[i][i])
@@ -311,11 +316,12 @@ compute_viterbi(const std::string& seq, Options opts) -> ScoreType
 template < typename P, typename S >
 auto
 Zuker<P, S>::
-traceback_viterbi() -> std::vector<u_int32_t>
+traceback_viterbi() -> std::vector<uint32_t>
 {
     const auto L = Ft_.size()-2;
-    std::vector<u_int32_t> pair(L+1, 0);
-    std::queue<std::tuple<TB, u_int32_t, u_int32_t>> tb_queue;
+    std::vector<uint32_t> pair(L+1, 0);
+    std::queue<std::tuple<TB, uint32_t, uint32_t>> tb_queue;
+    // Start traceback from the external loop covering the whole sequence.
     tb_queue.emplace(Ft_[1], 1, L);
 
     while (!tb_queue.empty())
@@ -324,6 +330,7 @@ traceback_viterbi() -> std::vector<u_int32_t>
         const auto [tb_type, kl] = tb;
         tb_queue.pop();
 
+        // Each TBType encodes which DP transition was chosen at (i,j).
         switch (tb_type)
         {
 #ifdef HELIX_LENGTH
@@ -470,12 +477,12 @@ traceback_viterbi() -> std::vector<u_int32_t>
 template < typename P, typename S >
 auto
 Zuker<P, S>::
-traceback_viterbi(const std::string& seq, Options opts) -> std::pair<typename P::ScoreType, std::vector<u_int32_t>>
+traceback_viterbi(const std::string& seq, Options opts) -> std::pair<typename P::ScoreType, std::vector<uint32_t>>
 {
     const auto L = Ft_.size()-2;
-    std::vector<u_int32_t> pair(L+1, 0);
+    std::vector<uint32_t> pair(L+1, 0);
     const auto [loss_paired, loss_unpaired, loss_const] = opts.make_penalty(L);
-    std::queue<std::tuple<TB, u_int32_t, u_int32_t>> tb_queue;
+    std::queue<std::tuple<TB, uint32_t, uint32_t>> tb_queue;
     tb_queue.emplace(Ft_[1], 1, L);
     auto e = 0.;
 
@@ -591,6 +598,7 @@ traceback_viterbi(const std::string& seq, Options opts) -> std::pair<typename P:
                 const auto [p, q] = std::get<1>(kl);
                 const auto k = i+p;
                 const auto l = j-q;
+                assert(in_pair_bounds(k, l));
                 assert(k < l);
                 e += param_->score_single_loop(i, j, k, l) + loss_paired[i][j] + loss_unpaired[i+1][k-1] + loss_unpaired[l+1][j-1];
                 param_->count_single_loop(i, j, k, l, 1.);

@@ -25,20 +25,20 @@ class Zuker : public Fold
             M1_PAIRED, M1_UNPAIRED,
             F_START, F_UNPAIRED, F_BIFURCATION
         };
-        using TB = std::tuple<TBType, std::variant<u_int32_t, std::pair<u_int8_t, u_int8_t>>>;
+        using TB = std::tuple<TBType, std::variant<uint32_t, std::pair<u_int8_t, u_int8_t>>>;
 
     public:
         Zuker(std::unique_ptr<P>&& p);
         auto compute_viterbi(const std::string& seq, Options opt = Options()) -> ScoreType;
-        auto traceback_viterbi() -> std::vector<u_int32_t>;
-        auto traceback_viterbi(const std::string& seq, Options opt = Options()) -> std::pair<typename P::ScoreType, std::vector<u_int32_t>>;
+        auto traceback_viterbi() -> std::vector<uint32_t>;
+        auto traceback_viterbi(const std::string& seq, Options opt = Options()) -> std::pair<typename P::ScoreType, std::vector<uint32_t>>;
         auto compute_inside(const std::string& seq, Options opt = Options()) -> ScoreType;
         void compute_outside(const std::string& seq, Options opt = Options());
         auto compute_basepairing_probabilities(const std::string& seq, Options opt = Options()) -> std::vector<std::vector<float>>;
         const P& param_model() const { return *param_; }
 
     private:
-        bool update_max(ScoreType& max_v, ScoreType new_v, TB& max_t, TBType tt, u_int32_t k=0);
+        bool update_max(ScoreType& max_v, ScoreType new_v, TB& max_t, TBType tt, uint32_t k=0);
         bool update_max(ScoreType& max_v, ScoreType new_v, TB& max_t, TBType tt, u_int8_t p, u_int8_t q);
 
     private:

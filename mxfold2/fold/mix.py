@@ -23,10 +23,26 @@ class MixedFold(AbstractFold):
         bpps = []
         for i in range(len(seq)):
             param_on_cpu = { 
-                'turner': {k: v.to("cpu") for k, v in param[i]['turner'].items() },
-                'positional': {k: v.to("cpu") for k, v in param[i]['positional'].items() }
+                'turner': {k: v.detach().to("cpu") for k, v in param[i]['turner'].items() },
+                'positional': {k: v.detach().to("cpu") for k, v in param[i]['positional'].items() }
             }
+
             param_on_cpu = {k: self.clear_count(v) for k, v in param_on_cpu.items()}
+
+            param_on_cpu = {
+                'turner': {k: v.to(dtype=torch.float32).contiguous() for k, v in param_on_cpu['turner'].items()},
+                'positional': {k: v.to(dtype=torch.float32).contiguous() for k, v in param_on_cpu['positional'].items()}
+            }
+
+            """
+            # sanity check
+            for k, v in param_on_cpu["positional"].items():
+                if k.startswith("count_"):
+                    print("[debug] positional count tensor:", k, v.shape, v.dtype, v.device, v.is_contiguous())
+            for k, v in param_on_cpu["turner"].items():
+                if k.startswith("count_"):
+                    print("[debug] turner count tensor:", k, v.shape, v.dtype, v.device, v.is_contiguous())
+            """
 
             with torch.no_grad():
                 v, pred, pair = interface.predict_mxfold(seq[i], param_on_cpu,
@@ -54,6 +70,7 @@ class MixedFold(AbstractFold):
 
         device = next(iter(param[0]['positional'].values())).device
         ss = torch.stack(ss) if torch.is_grad_enabled() else torch.tensor(ss, device=device)
+        
         if return_param:
             return ss, preds, pairs, param
         elif return_partfunc:

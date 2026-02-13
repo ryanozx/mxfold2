@@ -18,6 +18,7 @@ class AbstractFold(nn.Module):
         return param
 
 
+    """
     def calculate_differentiable_score(self, v, param, count):
         s = 0
         for n, p in param.items():
@@ -25,7 +26,53 @@ class AbstractFold(nn.Module):
                 s += torch.sum(p * count["count_"+n[6:]].to(p.device))
         s += v - s.item()
         return s
+    """
 
+    """
+    # CHANGE: memory stable calculate_differentiable_score to avoid OOM
+    def calculate_differentiable_score(self, v, param, count):
+        s = next(iter(param.values())).new_zeros(())
+
+        for n, p in param.items():
+            if n.startswith("score_"):
+                surrogate = torch.sum(p)
+                cpu_dot = torch.sum(p.detach().cpu() * count["count_" + n[6:]])
+                # Move only the scalar back to GPU (cheap, safe)
+                s = s + surrogate - surrogate.detach() + cpu_dot.to(device=p.device, dtype=p.dtype)
+
+        # Preserve gradient path through `v`
+        s = s + v - s.detach()
+        return s
+    """
+    
+    def calculate_differentiable_score(self, v, param, count):
+        """
+        Differentiable reconstruction of the Zuker score.
+
+        IMPORTANT:
+        - `count_*` tensors can be extremely large (O(L^2)).
+        - Moving them to GPU causes massive allocations (tens of GB) and OOM.
+        - We therefore keep `count_*` on CPU and reduce them to a scalar FIRST,
+          then move only the scalar contribution to GPU.
+        """
+        s = next(iter(param.values())).new_zeros(())
+
+        for n, p in param.items():
+            if n.startswith("score_"):
+                # 1. Targeted Surrogate: Grad(p) will be proportional to count
+                # We move count to GPU, but only for this specific multiplication
+                c_gpu = count["count_" + n[6:]].to(device=p.device, dtype=p.dtype)
+                surrogate = torch.sum(p * c_gpu)
+                
+                # 2. CPU Dot Product: The exact value for the forward pass
+                cpu_dot = torch.sum(p.detach().cpu() * count["count_" + n[6:]])
+                
+                # 3. Combine: Value comes from cpu_dot, Gradient comes from surrogate
+                s = s + surrogate - surrogate.detach() + cpu_dot.to(p.device)
+
+        # Preserve gradient path through `v`
+        s = s + v - s.detach()
+        return s
 
     def forward(self, seq, return_param=False, param=None, return_partfunc=False,
             max_internal_length=30, max_helix_length=30, constraint=None, reference=None,
@@ -37,8 +84,11 @@ class AbstractFold(nn.Module):
         pfs = []
         bpps = []
         for i in range(len(seq)):
-            param_on_cpu = { k: v.to("cpu") for k, v in param[i].items() }
+            # IMPORTANT: the C++ DP backend expects score/count tensors on CPU to be float32 and contiguous.
+            # If AMP produced fp16/bf16 (or non-contiguous views), the backend can misinterpret memory.
+            param_on_cpu = {k: v.detach().to("cpu") for k, v in param[i].items()}
             param_on_cpu = self.clear_count(param_on_cpu)
+            param_on_cpu = {k: v.to(dtype=torch.float32).contiguous() for k, v in param_on_cpu.items()}
             with torch.no_grad():
                 v, pred, pair = self.predict(seq[i], param_on_cpu,
                             max_internal_length=max_internal_length if max_internal_length is not None else len(seq[i]),

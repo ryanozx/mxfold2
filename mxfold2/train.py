@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -15,6 +16,7 @@ from .dataset import BPseqDataset
 from .fold.mix import MixedFold
 from .fold.rnafold import RNAFold
 from .fold.zuker import ZukerFold
+from .fold.layers import JoinType, JOIN_MAP, init_weights, init_heads
 from .loss import StructuredLoss, StructuredLossWithTurner
 
 try:
@@ -22,6 +24,7 @@ try:
 except ImportError:
     pass
 
+warmup_epochs = 5
 
 class Train:
     step = 0
@@ -29,35 +32,116 @@ class Train:
     def __init__(self):
         self.train_loader = None
         self.test_loader = None
+        self.scaler = torch.amp.GradScaler()
+
+    def log_model_stats(self, tag):
+        print(f"[init] {tag}")
+        for name, p in self.model.named_parameters():
+            if p is None or p.numel() == 0:
+                print(f"[init] {name} empty")
+                continue
+            p_det = p.detach()
+            finite = torch.isfinite(p_det)
+            if finite.any():
+                vals = p_det[finite]
+                mean = float(vals.mean().item())
+                if vals.numel() > 1:
+                    std = float(vals.std(unbiased=False).item())
+                else:
+                    std = 0.0
+                p_min = float(vals.min().item())
+                p_max = float(vals.max().item())
+            else:
+                mean = std = p_min = p_max = float("nan")
+            nan = int(torch.isnan(p_det).sum().item())
+            inf = int(torch.isinf(p_det).sum().item())
+            print(f"[init] {name} mean={mean:.4g} std={std:.4g} min={p_min:.4g} max={p_max:.4g} nan={nan} inf={inf}")
+
+    def log_step_stats(self, loss, margin_loss, sl_loss, l1_loss):
+        print(
+            "[step] "
+            f"loss={loss:.6g} margin={margin_loss:.6g} sl={sl_loss:.6g} l1={l1_loss:.6g}"
+        )
+
+    def log_grad_stats(self):
+        total_norm_sq = 0.0
+        for name, p in self.model.named_parameters():
+            if p is None or p.grad is None:
+                print(f"[grad] {name} grad=None")
+                continue
+            g_det = p.grad.detach()
+            if g_det.numel() == 0:
+                print(f"[grad] {name} grad=empty")
+                continue
+            finite = torch.isfinite(g_det)
+            if finite.any():
+                vals = g_det[finite]
+                g_min = float(vals.min().item())
+                g_max = float(vals.max().item())
+                g_mean = float(vals.mean().item())
+            else:
+                g_min = g_max = g_mean = float("nan")
+            g_nan = int(torch.isnan(g_det).sum().item())
+            g_inf = int(torch.isinf(g_det).sum().item())
+            print(f"[grad] {name} mean={g_mean:.4g} min={g_min:.4g} max={g_max:.4g} nan={g_nan} inf={g_inf}")
+            total_norm_sq += g_det.norm().item() ** 2
+        print(f"[grad] total_norm={total_norm_sq ** 0.5:.4g}")
 
 
-    def train(self, epoch):
+    def train(self, epoch, lr=1e-4, lr_min=1e-5):
         self.model.train()
         n_dataset = len(self.train_loader.dataset)
         loss_total, num = 0, 0
         running_loss, running_margin_loss, running_sl_loss, running_l1_loss, n_running_loss = 0, 0, 0, 0, 0
         start = time.time()
+
         with tqdm(total=n_dataset, disable=self.disable_progress_bar) as pbar:
-            for fnames, seqs, pairs in self.train_loader:
+            for batch_idx, (fnames, seqs, pairs) in enumerate(self.train_loader):
                 if self.verbose:
                     print()
                     print("Step: {}, {}".format(self.step, fnames))
                     self.step += 1
+
+                global_step = (epoch - 1) * n_dataset + batch_idx
+                total_warmup_steps = warmup_epochs * n_dataset
+                
+                if global_step < total_warmup_steps:
+                    curr_lr = lr_min + (lr - lr_min) * (global_step / total_warmup_steps)
+                    for param_group in self.optimizer.param_groups:
+                        lr_mult = param_group.get('lr_mult', 1.0)
+                        param_group['lr'] = curr_lr * lr_mult
+                else:
+                    curr_lr = lr
+
+                # 3. Log the status every few batches (to avoid bloating the log file)
+                if batch_idx % 10 == 0:
+                    print(f"[lr_log] Epoch: {epoch}, Batch: {batch_idx}, Global Step: {global_step}, LR: {curr_lr:.2e}")
+                
                 n_batch = len(seqs)
+                # torch.cuda.reset_peak_memory_stats()
                 self.optimizer.zero_grad()
-                loss, margin_loss, sl_loss, l1_loss = self.loss_fn(seqs, pairs, fname=fnames)
-                loss = loss.sum()
-                margin_loss = margin_loss.sum()
-                sl_loss = sl_loss.sum()
-                l1_loss = l1_loss.sum()
+
+                with torch.amp.autocast(dtype=torch.bfloat16, device_type="cuda"):
+                    loss, margin_loss, sl_loss, l1_loss = self.loss_fn(seqs, pairs, fname=fnames)
+                    loss = loss.sum()
+                    margin_loss = margin_loss.sum()
+                    sl_loss = sl_loss.sum()
+                    l1_loss = l1_loss.sum()
+
                 loss_total += loss.item()
                 num += n_batch
                 if loss.item() > 0.:
-                    loss.backward()
-                    if self.verbose:
-                        for n, p in self.model.named_parameters():
-                            print(n, torch.min(p).item(), torch.max(p).item(), torch.min(p.grad).item(), torch.max(p.grad).item())
-                    self.optimizer.step()
+                    self.scaler.scale(loss).backward()
+                    if self.verbose and batch_idx % 10 == 0:
+                        self.log_step_stats(loss.item(), margin_loss.item(), sl_loss.item(), l1_loss.item())
+                        self.log_grad_stats()
+                    # implement gradient clipping to avoid spikes caused by path flipping
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1000.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                
+                # print("peak GB", torch.cuda.max_memory_allocated() / 1e9)
 
                 pbar.set_postfix(train_loss='{:.3e}'.format(loss_total / num))
                 pbar.update(n_batch)
@@ -148,7 +232,7 @@ class Train:
             'dropout_rate': args.dropout_rate,
             'fc_dropout_rate': args.fc_dropout_rate,
             'num_att': args.num_att,
-            'pair_join': args.pair_join,
+            'pair_join': JOIN_MAP.get(args.pair_join.lower(), JoinType.CAT),
             'no_split_lr': args.no_split_lr,
         }
 
@@ -178,18 +262,56 @@ class Train:
         return model, config
 
 
-    def build_optimizer(self, optimizer, model, lr, l2_weight):
+    def build_optimizer(self, optimizer, model, lr, l2_weight, args=None):
+        evo_mult = getattr(args, "evoformer_lr_mult", 1.0) if args is not None else 1.0
+        head_mult = getattr(args, "head_lr_mult", 1.0) if args is not None else 1.0
+        use_diff_lr = evo_mult != 1.0 or head_mult != 1.0
+
+        param_groups = None
+        if use_diff_lr:
+            param_groups = []
+            used = set()
+
+            def add_group(params, group_lr, group_mult):
+                group_params = []
+                for p in params:
+                    if p is None or not p.requires_grad:
+                        continue
+                    pid = id(p)
+                    if pid in used:
+                        continue
+                    used.add(pid)
+                    group_params.append(p)
+                if group_params:
+                    param_groups.append({"params": group_params, "lr": group_lr, "lr_mult": group_mult})
+
+            if hasattr(model, "net") and hasattr(model.net, "evoformer"):
+                add_group(model.net.evoformer.parameters(), lr * evo_mult, evo_mult)
+            if hasattr(model, "net") and hasattr(model.net, "fc_paired"):
+                add_group(model.net.fc_paired.parameters(), lr * head_mult, head_mult)
+            if hasattr(model, "net") and hasattr(model.net, "fc_unpaired") and model.net.fc_unpaired is not None:
+                add_group(model.net.fc_unpaired.parameters(), lr * head_mult, head_mult)
+            if hasattr(model, "fc_length"):
+                for key in model.fc_length:
+                    add_group(model.fc_length[key].parameters(), lr * head_mult, head_mult)
+            add_group(model.parameters(), lr, 1.0)
+
         if optimizer == 'Adam':
-            return optim.Adam(model.parameters(), lr=lr, amsgrad=False, weight_decay=l2_weight)
+            return optim.Adam(param_groups if param_groups is not None else model.parameters(),
+                              lr=lr, amsgrad=False, weight_decay=l2_weight)
         elif optimizer =='AdamW':
-            return optim.AdamW(model.parameters(), lr=lr, amsgrad=False, weight_decay=l2_weight)
+            return optim.AdamW(param_groups if param_groups is not None else model.parameters(),
+                               lr=lr, amsgrad=False, weight_decay=l2_weight)
         elif optimizer == 'RMSprop':
-            return optim.RMSprop(model.parameters(), lr=lr, weight_decay=l2_weight)
+            return optim.RMSprop(param_groups if param_groups is not None else model.parameters(),
+                                 lr=lr, weight_decay=l2_weight)
         elif optimizer == 'SGD':
-            return optim.SGD(model.parameters(), nesterov=True, lr=lr, momentum=0.9, weight_decay=l2_weight)
+            return optim.SGD(param_groups if param_groups is not None else model.parameters(),
+                             nesterov=True, lr=lr, momentum=0.9, weight_decay=l2_weight)
             #return optim.SGD(model.parameters(), lr=lr, weight_decay=l2_weight)
         elif optimizer == 'ASGD':
-            return optim.ASGD(model.parameters(), lr=lr, weight_decay=l2_weight)
+            return optim.ASGD(param_groups if param_groups is not None else model.parameters(),
+                              lr=lr, weight_decay=l2_weight)
         else:
             raise('not implemented')
 
@@ -230,6 +352,10 @@ class Train:
         if args.log_dir is not None and 'SummaryWriter' in globals():
             self.writer = SummaryWriter(log_dir=args.log_dir)
 
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        # dataset preparation
         train_dataset = BPseqDataset(args.input)
         self.train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
         if args.test_input is not None:
@@ -244,6 +370,11 @@ class Train:
 
         self.model, config = self.build_model(args)
         config.update({ 'model': args.model, 'param': args.param })
+
+        self.init_model_weights()
+
+        if self.verbose:
+            self.log_model_stats("post_init")
         
         if args.init_param != '':
             init_param = Path(args.init_param)
@@ -253,20 +384,31 @@ class Train:
             if isinstance(p, dict) and 'model_state_dict' in p:
                 p = p['model_state_dict']
             self.model.load_state_dict(p)
+            if self.verbose:
+                self.log_model_stats("post_load")
 
         if args.gpu >= 0:
             self.model.to(torch.device("cuda", args.gpu))
-        self.optimizer = self.build_optimizer(args.optimizer, self.model, args.lr, args.l2_weight)
+        self.optimizer = self.build_optimizer(args.optimizer, self.model, args.lr, args.l2_weight, args)
+        self.scheduler = None
+        if args.lr_scheduler == "cosine":
+            self.scheduler = CosineAnnealingLR(
+                self.optimizer,
+                T_max=args.epochs - warmup_epochs,
+                eta_min=args.lr_min,
+            )
         self.loss_fn = self.build_loss_function(args.loss_func, self.model, args)
 
         checkpoint_epoch = 0
         if args.resume is not None:
             checkpoint_epoch = self.resume_checkpoint(args.resume)
 
-        for epoch in range(checkpoint_epoch+1, args.epochs+1):
-            self.train(epoch)
+        for epoch in range(checkpoint_epoch + 1, args.epochs + 1):
+            self.train(epoch, args.lr, args.lr_min)
             if self.test_loader is not None:
                 self.test(epoch)
+            if self.scheduler is not None and epoch > warmup_epochs:
+                self.scheduler.step()
             if args.log_dir is not None:
                 self.save_checkpoint(args.log_dir, epoch)
 
@@ -279,6 +421,20 @@ class Train:
             self.writer.close()
 
         return self.model
+    
+    def init_model_weights(self):
+        # CHANGE: weight initialisation
+        self.model.apply(init_weights)
+
+        self.model.net.fc_paired.apply(init_heads)
+        self.model.net.premsa.apply(init_heads)
+
+        if self.model.net.fc_unpaired is not None:
+            self.model.net.fc_unpaired.apply(init_heads)
+
+        if hasattr(self.model, 'fc_length'):
+            for key in self.model.fc_length:
+                self.model.fc_length[key].apply(init_heads)
 
 
     @classmethod
@@ -322,6 +478,14 @@ class Train:
                             help='the weight for score loss for hinge_mix loss (default: 1)')
         gparser.add_argument('--lr', type=float, default=0.001,
                             help='the learning rate for optimizer (default: 0.001)')
+        gparser.add_argument('--evoformer-lr-mult', type=float, default=1.0,
+                            help='learning-rate multiplier for Evoformer parameters (default: 1.0)')
+        gparser.add_argument('--head-lr-mult', type=float, default=0.01,
+                            help='learning-rate multiplier for scoring head parameters (default: 1.0)')
+        gparser.add_argument('--lr-scheduler', choices=('none', 'cosine'), default='none',
+                            help='learning rate scheduler (default: none)')
+        gparser.add_argument('--lr-min', type=float, default=1e-4,
+                            help='minimum learning rate for cosine scheduler (default: 1e-4)')
         gparser.add_argument('--loss-func', choices=('hinge', 'hinge_mix'), default='hinge',
                             help="loss fuction ('hinge', 'hinge_mix') ")
         gparser.add_argument('--loss-pos-paired', type=float, default=0.5,
