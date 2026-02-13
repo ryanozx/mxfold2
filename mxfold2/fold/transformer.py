@@ -10,6 +10,8 @@ from .patched_transformer_encoder import TransformerEncoderPatchedLayer
 class TransformerLayer(nn.Module):
     def __init__(self, n_in, n_head, n_hidden, n_layers, dropout=0.5):
         super(TransformerLayer, self).__init__()
+        # TODO: Replace absolute positional encoder with a relative positional encoder (10/1/26). If we replace the CNNLSTMEncoder
+        # entirely with a Transformer, we need to encode locality which was previously achieved via the CNN
         self.pos_encoder = PositionalEncoding(n_in, dropout, max_len=1000)
 
         self.layers = nn.ModuleList([TransformerEncoderPatchedLayer(n_in, n_head, n_hidden, dropout) for _ in range(n_layers)])
@@ -54,3 +56,7 @@ class PositionalEncoding(nn.Module):
     def forward(self, x): # (N, B, C)
         x = x + self.pe[:x.size(0), :]
         return self.dropout(x)
+    
+class RelativePositionalEncoding(nn.Module):
+    def __init__(self):
+        pass

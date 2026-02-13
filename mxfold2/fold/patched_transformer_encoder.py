@@ -9,7 +9,8 @@ class TransformerEncoderPatchedLayer(TransformerEncoderLayer):
         x: Tensor,
         attn_mask: Optional[Tensor],
         key_padding_mask: Optional[Tensor],
-        need_weights: bool = False
+        need_weights: bool = False,
+        is_causal: bool = False
     ) -> Tensor:
         attn_out, attn_weights = self.self_attn(
             x,
