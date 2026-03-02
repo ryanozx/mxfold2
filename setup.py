@@ -10,8 +10,8 @@ package_data = \
 install_requires = \
 ['numpy>=1.18,<2.0',
  'pybind11>=2.6.2,<3.0.0',
- 'torch>=1.4,<2.0',
- 'torchvision>=0,<1',
+ 'torch>=2.1,<3.0',
+ 'torchvision>=0.16,<1.0',
  'tqdm>=4.40,<5.0',
  'wheel>=0.38.0,<0.39.0']
 
