@@ -2,13 +2,13 @@ import os
 import random
 import time
 from pathlib import Path
+from enum import Enum
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -17,26 +17,53 @@ from .fold.mix import MixedFold
 from .fold.rnafold import RNAFold
 from .fold.zuker import ZukerFold
 from .fold.layers import JoinType, JOIN_MAP, init_weights, init_heads
-from .loss import StructuredLoss, StructuredLossWithTurner
+from .loss import Loss, StructuredLoss, StructuredLossWithTurner
 
 try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
     pass
 
-warmup_epochs = 5
+max_norm = 1000.0
+epsilon = 1e-8
+
+class TrainStage(Enum):
+    PRE_UNSCALE = 1
+    PRE_CLIP = 2
+    POST_CLIP = 3
 
 class Train:
     step = 0
+    HEAD_GROUP_PREFIXES = ("fc_paired", "fc_unpaired", "fc_length/")
+    HEAD_PARAM_PREFIXES = ("net.fc_paired.", "net.fc_unpaired.", "fc_length.")
+    EVOFORMER_GROUP_NAME = "evoformer"
+    EVOFORMER_PARAM_PREFIX = "net.evoformer."
 
     def __init__(self):
         self.train_loader = None
         self.test_loader = None
-        self.scaler = torch.amp.GradScaler()
+        self.scaler = torch.amp.GradScaler(device="cuda", enabled=True)
 
-    def log_model_stats(self, tag):
+    @staticmethod
+    def _resolve_zuker_model(model):
+        if isinstance(model, ZukerFold):
+            return model
+        if isinstance(model, MixedFold):
+            return model.zuker
+        return None
+
+    def log_model_init_stats(self, tag):
+        """
+        prints initial param values
+        the objective of these stats are to verify the initialisation of the model
+
+        - what it should do:
+            - for each group, print the initialisation strategy and then the stats for the layers in the group
+        - concerns:
+            - how should it report layers that are not part of any group/has default initialisation? 
+        """
         print(f"[init] {tag}")
-        for name, p in self.model.named_parameters():
+        for name, p in self._resolve_zuker_model(self.model).named_parameters():
             if p is None or p.numel() == 0:
                 print(f"[init] {name} empty")
                 continue
@@ -57,21 +84,34 @@ class Train:
             inf = int(torch.isinf(p_det).sum().item())
             print(f"[init] {name} mean={mean:.4g} std={std:.4g} min={p_min:.4g} max={p_max:.4g} nan={nan} inf={inf}")
 
-    def log_step_stats(self, loss, margin_loss, sl_loss, l1_loss):
-        print(
-            "[step] "
-            f"loss={loss:.6g} margin={margin_loss:.6g} sl={sl_loss:.6g} l1={l1_loss:.6g}"
-        )
+    def log_grad_stats(self, step: int, stage: TrainStage = TrainStage.PRE_UNSCALE):
+        """
+        prints gradient statistics for each named parameter. this does not write into tensorboard
 
-    def log_grad_stats(self):
+        why we need it: i am trying to track down why the signal does not successfully propagate backward. printing stats of each layer helps me identify the following:
+        - what the values are pre-and-post unscaling
+        - what the values are pre-and-post clip
+        - max - min: see whether weight layers are actually learning stuff rather than just being noise
+        - mean: if the mean is near zero, it means this layer isn't contributing anything
+        - nan and inf: self-explanatory, alerts us if there is an exploding gradient or underflow
+        - 
+        """
         total_norm_sq = 0.0
-        for name, p in self.model.named_parameters():
+        match stage:
+            case TrainStage.PRE_UNSCALE:
+                stage_name = "pre_unscale"
+            case TrainStage.PRE_CLIP:
+                stage_name = "pre_clip"
+            case TrainStage.POST_CLIP:
+                stage_name = "post_clip"
+                
+        for name, p in self._resolve_zuker_model(self.model).named_parameters():
             if p is None or p.grad is None:
-                print(f"[grad] {name} grad=None")
+                print(f"[grad] [{stage_name}] {name} grad=None")
                 continue
             g_det = p.grad.detach()
             if g_det.numel() == 0:
-                print(f"[grad] {name} grad=empty")
+                print(f"[grad] [{stage_name}] {name} grad=empty")
                 continue
             finite = torch.isfinite(g_det)
             if finite.any():
@@ -83,17 +123,264 @@ class Train:
                 g_min = g_max = g_mean = float("nan")
             g_nan = int(torch.isnan(g_det).sum().item())
             g_inf = int(torch.isinf(g_det).sum().item())
-            print(f"[grad] {name} mean={g_mean:.4g} min={g_min:.4g} max={g_max:.4g} nan={g_nan} inf={g_inf}")
+            print(f"[grad] [{stage_name}] {name} mean={g_mean:.4g} min={g_min:.4g} max={g_max:.4g} nan={g_nan} inf={g_inf}")
             total_norm_sq += g_det.norm().item() ** 2
-        print(f"[grad] total_norm={total_norm_sq ** 0.5:.4g}")
+        print(f"[grad] [{stage_name}] total_norm={total_norm_sq ** 0.5:.4g}")
 
+    def log_grad_group_metrics(self, step: int):
+        """
+        logs grad norms for each group
 
-    def train(self, epoch, lr=1e-4, lr_min=1e-5):
+        goal: comparing total norms across different groups allows us to determine whether updates are flowing through the model
+        """
+        if self.writer is None:
+            return
+        
+        evoformer_norm = 0.
+        fc_norm = 0.
+
+        for i, group in enumerate(self.optimizer.param_groups):
+            group_name = group.get("name", f"group_{i}")
+            norm_sq = 0.0
+            nan_count = 0
+            inf_count = 0
+            n_with_grad = 0
+            for p in group["params"]:
+                if p is None or p.grad is None:
+                    continue
+                g = p.grad.detach()
+                norm_sq += g.norm().item() ** 2
+                nan_count += int(torch.isnan(g).sum().item())
+                inf_count += int(torch.isinf(g).sum().item())
+                n_with_grad += 1
+            self.writer.add_scalar(f"train/health/grad_norm/{group_name}", norm_sq ** 0.5, step)
+
+            if group_name == "evoformer":
+                evoformer_norm += norm_sq ** 0.5
+            elif group_name.startswith("fc_"):
+                fc_norm += norm_sq ** 0.5
+        
+        self.writer.add_scalar("train/health/evoformer_fc_norm_ratio", evoformer_norm / max(fc_norm, 1.), step)
+
+    def _iter_head_params(self):
+        # Prefer optimizer-defined head groups when available.
+        seen = set()
+        head_params = []
+        for group in self.optimizer.param_groups:
+            name = group.get("name", "")
+            if not name.startswith(self.HEAD_GROUP_PREFIXES):
+                continue
+            for p in group.get("params", []):
+                if p is None or not p.requires_grad:
+                    continue
+                pid = id(p)
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                head_params.append(p)
+
+        if head_params:
+            return head_params
+
+        # Fallback for single-group optimizers: collect head params by module prefix.
+        zuker_model = self._resolve_zuker_model(self.model)
+        if zuker_model is None:
+            return head_params
+
+        for name, p in zuker_model.named_parameters():
+            if p is None or not p.requires_grad:
+                continue
+            if name.startswith(self.HEAD_PARAM_PREFIXES):
+                pid = id(p)
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                head_params.append(p)
+        return head_params
+    
+    def freeze_heads(self):
+        # Collect by name prefixes so we can still find the same params after freezing.
+        seen = set()
+        zuker_model = self._resolve_zuker_model(self.model)
+        if zuker_model is None:
+            return
+        for name, p in zuker_model.named_parameters():
+            if p is None:
+                continue
+            if not name.startswith(self.HEAD_PARAM_PREFIXES):
+                continue
+            pid = id(p)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            p.requires_grad = False
+
+    def unfreeze_heads(self):
+        seen = set()
+        zuker_model = self._resolve_zuker_model(self.model)
+        if zuker_model is None:
+            return
+        for name, p in zuker_model.named_parameters():
+            if p is None:
+                continue
+            if not name.startswith(self.HEAD_PARAM_PREFIXES):
+                continue
+            pid = id(p)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            p.requires_grad = True
+
+    def clip_head_grad_norm_(self, max_head_norm: float) -> float:
+        head_params = self._iter_head_params()
+        if not head_params:
+            return 0.0
+        clipped_norm = torch.nn.utils.clip_grad_norm_(head_params, max_norm=max_head_norm)
+        return float(clipped_norm.item() if isinstance(clipped_norm, torch.Tensor) else clipped_norm)
+
+    def _iter_evoformer_params(self):
+        # Prefer optimizer-defined evoformer group when available.
+        evoformer_params = []
+        for group in self.optimizer.param_groups:
+            name = group.get("name", "")
+            if name != self.EVOFORMER_GROUP_NAME:
+                continue
+            for p in group.get("params", []):
+                if p is None or not p.requires_grad:
+                    continue
+                evoformer_params.append(p)
+
+        if evoformer_params:
+            return evoformer_params
+
+        # Fallback for single-group optimizers: collect evoformer params by module prefix.
+        zuker_model = self._resolve_zuker_model(self.model)
+        if zuker_model is None:
+            return evoformer_params
+
+        for name, p in zuker_model.named_parameters():
+            if p is None or not p.requires_grad:
+                continue
+            if name.startswith(self.EVOFORMER_PARAM_PREFIX):
+                evoformer_params.append(p)
+        return evoformer_params
+
+    def clip_evoformer_grad_norm_(self, max_evoformer_norm: float) -> float:
+        evoformer_params = self._iter_evoformer_params()
+        if not evoformer_params:
+            return 0.0
+        clipped_norm = torch.nn.utils.clip_grad_norm_(evoformer_params, max_norm=max_evoformer_norm)
+        return float(clipped_norm.item() if isinstance(clipped_norm, torch.Tensor) else clipped_norm)
+
+    # TODO: clean this up
+    @staticmethod
+    def compute_grad_norm(params) -> float:
+        norm_sq = 0.0
+        for p in params:
+            if p is None or p.grad is None:
+                continue
+            g = p.grad.detach()
+            norm_sq += g.norm().item() ** 2
+        return norm_sq ** 0.5
+
+    @staticmethod
+    def compute_param_std(params) -> float:
+        total = 0
+        sum_x = 0.0
+        sum_x2 = 0.0
+        for p in params:
+            if p is None:
+                continue
+            t = p.detach().reshape(-1)
+            finite = torch.isfinite(t)
+            if not finite.any():
+                continue
+            vals = t[finite].to(dtype=torch.float64)
+            total += vals.numel()
+            sum_x += vals.sum().item()
+            sum_x2 += (vals * vals).sum().item()
+        if total <= 1:
+            return 0.0
+        mean = sum_x / total
+        var = max(sum_x2 / total - mean * mean, 0.0)
+        return var ** 0.5
+
+    def log_param_std_metrics(self, step: int):
+        model_params = [p for p in self.model.parameters() if p is not None and p.requires_grad]
+        model_std = self.compute_param_std(model_params)
+        if self.writer is not None:
+            self.writer.add_scalar("train/param_std/all", model_std, step)
+
+        evoformer_params = []
+        head_params = []
+        for i, group in enumerate(self.optimizer.param_groups):
+            group_name = group.get("name", f"group_{i}")
+            std = self.compute_param_std(group["params"])
+            if self.writer is not None:
+                self.writer.add_scalar(f"train/param_std/{group_name}", std, step)
+            if group_name == "evoformer":
+                evoformer_params.extend(group["params"])
+            elif group_name.startswith("fc_"):
+                head_params.extend(group["params"])
+
+        evo_std = None
+        if evoformer_params:
+            evo_std = self.compute_param_std(evoformer_params)
+            if self.writer is not None:
+                self.writer.add_scalar("train/param_std/evoformer", evo_std, step)
+        head_std = None
+        if head_params:
+            head_std = self.compute_param_std(head_params)
+            if self.writer is not None:
+                self.writer.add_scalar("train/param_std/head", head_std, step)
+
+        if self.verbose:
+            parts = [f"[param_std] step={step} all={model_std:.4g}"]
+            if evo_std is not None:
+                parts.append(f"evoformer={evo_std:.4g}")
+            if head_std is not None:
+                parts.append(f"head={head_std:.4g}")
+            print(" ".join(parts))
+
+    def log_head_bias_mean_metrics(self, step: int):
+        head_ids = {id(p) for p in self._iter_head_params()}
+        means = []
+
+        for name, p in self.model.named_parameters():
+            if p is None or not p.requires_grad:
+                continue
+            if id(p) not in head_ids:
+                continue
+            if not name.endswith("bias"):
+                continue
+
+            t = p.detach().reshape(-1)
+            finite = torch.isfinite(t)
+            if finite.any():
+                mean = float(t[finite].mean().item())
+                means.append(mean)
+            else:
+                mean = float("nan")
+
+            if self.writer is not None:
+                self.writer.add_scalar(f"train/head_bias_mean/{name.replace('.', '/')}", mean, step)
+
+        if means:
+            agg_mean = float(np.mean(means))
+            if self.writer is not None:
+                self.writer.add_scalar("train/head_bias_mean/aggregate", agg_mean, step)
+            if self.verbose:
+                print(f"[head_bias_mean] step={step} aggregate={agg_mean:.4g}")
+
+    def train(self, epoch, lr=1e-4):
         self.model.train()
         n_dataset = len(self.train_loader.dataset)
         loss_total, num = 0, 0
         running_loss, running_margin_loss, running_sl_loss, running_l1_loss, n_running_loss = 0, 0, 0, 0, 0
+        running_energy_gap = 0
         start = time.time()
+
+        evoformer_max_grad_norm = self.max_evoformer_grad_norm
 
         with tqdm(total=n_dataset, disable=self.disable_progress_bar) as pbar:
             for batch_idx, (fnames, seqs, pairs) in enumerate(self.train_loader):
@@ -102,16 +389,8 @@ class Train:
                     print("Step: {}, {}".format(self.step, fnames))
                     self.step += 1
 
-                global_step = (epoch - 1) * n_dataset + batch_idx
-                total_warmup_steps = warmup_epochs * n_dataset
-                
-                if global_step < total_warmup_steps:
-                    curr_lr = lr_min + (lr - lr_min) * (global_step / total_warmup_steps)
-                    for param_group in self.optimizer.param_groups:
-                        lr_mult = param_group.get('lr_mult', 1.0)
-                        param_group['lr'] = curr_lr * lr_mult
-                else:
-                    curr_lr = lr
+                global_step: int = (epoch - 1) * n_dataset + batch_idx                
+                curr_lr = lr
 
                 # 3. Log the status every few batches (to avoid bloating the log file)
                 if batch_idx % 10 == 0:
@@ -121,23 +400,78 @@ class Train:
                 # torch.cuda.reset_peak_memory_stats()
                 self.optimizer.zero_grad()
 
-                with torch.amp.autocast(dtype=torch.bfloat16, device_type="cuda"):
-                    loss, margin_loss, sl_loss, l1_loss = self.loss_fn(seqs, pairs, fname=fnames)
-                    loss = loss.sum()
-                    margin_loss = margin_loss.sum()
-                    sl_loss = sl_loss.sum()
-                    l1_loss = l1_loss.sum()
+                with torch.amp.autocast(device_type="cuda", dtype=torch.float32):
+                    loss_calc : Loss = self.loss_fn(seqs, pairs, fname=fnames)
+                    # yes, batch size is 1, but we use .sum() to future-proof
+                    loss = loss_calc.loss.sum()
+                    margin_loss = loss_calc.margin_loss.sum()
+                    sl_loss = loss_calc.score_loss.sum()
+                    l1_loss = loss_calc.l1_loss.sum()
 
                 loss_total += loss.item()
                 num += n_batch
                 if loss.item() > 0.:
                     self.scaler.scale(loss).backward()
                     if self.verbose and batch_idx % 10 == 0:
-                        self.log_step_stats(loss.item(), margin_loss.item(), sl_loss.item(), l1_loss.item())
-                        self.log_grad_stats()
-                    # implement gradient clipping to avoid spikes caused by path flipping
+                        print(f"[step] {loss}")
+                        self.log_grad_stats(global_step, TrainStage.PRE_UNSCALE)
+                    # Clip Evoformer and head modules separately.
                     self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1000.0)
+                    if self.verbose and batch_idx % 10 == 0:
+                        self.log_grad_stats(global_step, TrainStage.PRE_CLIP)
+                        self.log_grad_group_metrics(global_step)
+
+                        # TODO: clean this up
+                        zuker_model = self._resolve_zuker_model(self.model)
+                        if zuker_model is not None and hasattr(zuker_model, "_score_range") and hasattr(zuker_model, "_score_mean"):
+                            score_paired_range, score_unpaired_range = zuker_model._score_range
+                            score_paired_mean, score_unpaired_mean = zuker_model._score_mean
+                            if self.writer is not None:
+                                self.writer.add_scalar("train/summary/score_ratios", (score_paired_range + epsilon) / (score_unpaired_range + epsilon), global_step)
+                                self.writer.add_scalar("train/representations/contrast/score_paired_range", score_paired_range, global_step)
+                                self.writer.add_scalar("train/representations/contrast/score_unpaired_range", score_unpaired_range, global_step)
+                                self.writer.add_scalar("train/representations/contrast/score_paired_mean", score_paired_mean, global_step)
+                                self.writer.add_scalar("train/representations/contrast/score_unpaired_mean", score_unpaired_mean, global_step)
+
+
+                    evoformer_params = self._iter_evoformer_params()
+                    pre_clip_evoformer_norm = self.compute_grad_norm(evoformer_params)
+                    evoformer_clipping_factor = min(1.0, evoformer_max_grad_norm / max(pre_clip_evoformer_norm, epsilon))
+                    clipped_evoformer_norm = self.clip_evoformer_grad_norm_(evoformer_max_grad_norm)
+                    post_clip_evoformer_norm = self.compute_grad_norm(evoformer_params)
+
+                    head_params = self._iter_head_params()
+                    pre_clip_head_norm = self.compute_grad_norm(head_params)
+                    clipping_factor = min(1.0, self.max_head_grad_norm / max(pre_clip_head_norm, epsilon))
+                    clipped_head_norm = self.clip_head_grad_norm_(self.max_head_grad_norm)
+                    post_clip_head_norm = self.compute_grad_norm(head_params)
+                    if self.writer is not None:
+                        self.writer.add_scalar("train/health/evoformer/total_norm_pre_clip", pre_clip_evoformer_norm, global_step)
+                        self.writer.add_scalar("train/health/evoformer/total_norm_post_clip", post_clip_evoformer_norm, global_step)
+                        self.writer.add_scalar("train/health/evoformer/clipping_factor", evoformer_clipping_factor, global_step)
+                        self.writer.add_scalar("train/health/head/total_norm_pre_clip", pre_clip_head_norm, global_step)
+                        self.writer.add_scalar("train/health/head/total_norm_post_clip", post_clip_head_norm, global_step)
+                        self.writer.add_scalar("train/health/head/clipping_factor", clipping_factor, global_step)
+                        scale_factor = self.scaler.get_scale()
+                        self.writer.add_scalar("train/health/Numerical/Grad_Scale", scale_factor, global_step)
+                    if self.verbose and batch_idx % 10 == 0:
+                        self.log_grad_stats(global_step, TrainStage.POST_CLIP)
+                        print(
+                            f"[clip] evoformer_total_norm_pre={pre_clip_evoformer_norm:.4g} "
+                            f"evoformer_total_norm_post={post_clip_evoformer_norm:.4g} "
+                            f"evoformer_clip_factor={evoformer_clipping_factor:.4g} "
+                            f"evoformer_reported_norm={clipped_evoformer_norm:.4g} "
+                            f"evoformer_max_norm={evoformer_max_grad_norm:.4g}"
+                        )
+                        print(
+                            f"[clip] head_total_norm_pre={pre_clip_head_norm:.4g} "
+                            f"head_total_norm_post={post_clip_head_norm:.4g} "
+                            f"head_clip_factor={clipping_factor:.4g} "
+                            f"head_reported_norm={clipped_head_norm:.4g} "
+                            f"head_max_norm={self.max_head_grad_norm:.4g}"
+                        )
+                        self.log_param_std_metrics(global_step)
+                        self.log_head_bias_mean_metrics(global_step)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 
@@ -150,19 +484,23 @@ class Train:
                 running_margin_loss += margin_loss.item()
                 running_sl_loss += sl_loss.item()
                 running_l1_loss += l1_loss.item()
+                running_energy_gap += loss_calc.calc_energy_gap()
                 n_running_loss += n_batch
                 if n_running_loss >= 100 or num >= n_dataset:
                     running_loss /= n_running_loss
                     running_margin_loss /= n_running_loss
                     running_sl_loss /= n_running_loss
                     running_l1_loss /= n_running_loss
+                    running_energy_gap /= n_running_loss
                     if self.writer is not None:
-                        step = (epoch-1) * n_dataset + num
-                        self.writer.add_scalar("train/loss", running_loss, step)
-                        self.writer.add_scalar("train/margin_loss", running_margin_loss, step)
-                        self.writer.add_scalar("train/sl_loss", running_sl_loss, step)
-                        self.writer.add_scalar("train/l1_loss", running_l1_loss, step)
-                    running_loss, running_margin_loss, running_sl_loss, running_l1_loss, n_running_loss = 0, 0, 0, 0, 0
+                        self.writer.add_scalar("train/summary/loss", running_loss, global_step)
+                        self.writer.add_scalar("train/summary/margin_loss", running_margin_loss, global_step)
+                        self.writer.add_scalar("train/summary/sl_loss", running_sl_loss, global_step)
+                        self.writer.add_scalar("train/summary/l1_loss", running_l1_loss, global_step)
+                        self.writer.add_scalar("train/summary/energy_gap", running_energy_gap,global_step)
+                        self.writer.add_scalar("train/summary/margin_sl_ratio", (sl_loss.item() + epsilon) / (margin_loss.item() + epsilon), global_step)
+                    running_loss, running_margin_loss, running_sl_loss, running_l1_loss, running_energy_gap = 0, 0, 0, 0, 0
+                    n_running_loss = 0
         elapsed_time = time.time() - start
         if self.verbose:
             print()
@@ -179,7 +517,8 @@ class Train:
         with torch.no_grad(), tqdm(total=n_dataset, disable=self.disable_progress_bar) as pbar:
             for fnames, seqs, pairs in self.test_loader:
                 n_batch = len(seqs)
-                loss, _, _, _ = self.loss_fn(seqs, pairs, fname=fnames)
+                loss_calc = self.loss_fn(seqs, pairs, fname=fnames)
+                loss = loss_calc.loss
                 loss_total += loss.item()
                 num += n_batch
                 pbar.set_postfix(test_loss='{:.3e}'.format(loss_total / num))
@@ -237,16 +576,16 @@ class Train:
         }
 
         if args.model == 'Zuker':
-            model = ZukerFold(model_type='M', **config)
+            model = ZukerFold(model_type=ZukerFold.ZukerType.M, **config)
 
         elif args.model == 'ZukerC':
-            model = ZukerFold(model_type='C', **config)
+            model = ZukerFold(model_type=ZukerFold.ZukerType.C, **config)
 
         elif args.model == 'ZukerL':
-            model = ZukerFold(model_type="L", **config)
+            model = ZukerFold(model_type=ZukerFold.ZukerType.L, **config)
 
         elif args.model == 'ZukerS':
-            model = ZukerFold(model_type="S", **config)
+            model = ZukerFold(model_type=ZukerFold.ZukerType.S, **config)
 
         elif args.model == 'Mix':
             from . import param_turner2004
@@ -254,7 +593,7 @@ class Train:
 
         elif args.model == 'MixC':
             from . import param_turner2004
-            model = MixedFold(init_param=param_turner2004, model_type='C', **config)
+            model = MixedFold(init_param=param_turner2004, model_type=ZukerFold.ZukerType.C, **config)
 
         else:
             raise('not implemented')
@@ -267,12 +606,15 @@ class Train:
         head_mult = getattr(args, "head_lr_mult", 1.0) if args is not None else 1.0
         use_diff_lr = evo_mult != 1.0 or head_mult != 1.0
 
+        print(f"[setup] evoformer lr mult: {evo_mult}, head lr mult: {head_mult}")
+
         param_groups = None
         if use_diff_lr:
             param_groups = []
             used = set()
+            zuker_model = self._resolve_zuker_model(model)
 
-            def add_group(params, group_lr, group_mult):
+            def add_group(params, group_lr, group_mult, group_name):
                 group_params = []
                 for p in params:
                     if p is None or not p.requires_grad:
@@ -283,18 +625,26 @@ class Train:
                     used.add(pid)
                     group_params.append(p)
                 if group_params:
-                    param_groups.append({"params": group_params, "lr": group_lr, "lr_mult": group_mult})
+                    param_groups.append({
+                        "params": group_params,
+                        "lr": group_lr,
+                        "lr_mult": group_mult,
+                        "name": group_name
+                    })
 
-            if hasattr(model, "net") and hasattr(model.net, "evoformer"):
-                add_group(model.net.evoformer.parameters(), lr * evo_mult, evo_mult)
-            if hasattr(model, "net") and hasattr(model.net, "fc_paired"):
-                add_group(model.net.fc_paired.parameters(), lr * head_mult, head_mult)
-            if hasattr(model, "net") and hasattr(model.net, "fc_unpaired") and model.net.fc_unpaired is not None:
-                add_group(model.net.fc_unpaired.parameters(), lr * head_mult, head_mult)
-            if hasattr(model, "fc_length"):
-                for key in model.fc_length:
-                    add_group(model.fc_length[key].parameters(), lr * head_mult, head_mult)
-            add_group(model.parameters(), lr, 1.0)
+            if zuker_model is not None and hasattr(zuker_model, "net") and hasattr(zuker_model.net, "evoformer"):
+                add_group(zuker_model.net.evoformer.parameters(), lr * evo_mult, evo_mult, "evoformer")
+            if zuker_model is not None and hasattr(zuker_model, "net") and hasattr(zuker_model.net, "fc_paired"):
+                add_group(zuker_model.net.fc_paired.parameters(), lr * head_mult, head_mult, "fc_paired")
+            if zuker_model is not None and hasattr(zuker_model, "net") and hasattr(zuker_model.net, "fc_unpaired") and zuker_model.net.fc_unpaired is not None:
+                add_group(zuker_model.net.fc_unpaired.parameters(), lr * head_mult, head_mult, "fc_unpaired")
+            if zuker_model is not None and hasattr(zuker_model, "fc_length"):
+                for key in zuker_model.fc_length:
+                    add_group(zuker_model.fc_length[key].parameters(), lr * head_mult, head_mult, f"fc_length/{key}")
+            add_group(model.parameters(), lr, 1.0, "remaining")
+        else:
+            all_params = [p for p in model.parameters() if p is not None and p.requires_grad]
+            param_groups = [{"params": all_params, "lr": lr, "name": "all"}]
 
         if optimizer == 'Adam':
             return optim.Adam(param_groups if param_groups is not None else model.parameters(),
@@ -348,6 +698,8 @@ class Train:
     def run(self, args, conf=None):
         self.disable_progress_bar = args.disable_progress_bar
         self.verbose = args.verbose
+        self.max_head_grad_norm = args.max_head_grad_norm
+        self.max_evoformer_grad_norm = args.max_evoformer_grad_norm
         self.writer = None
         if args.log_dir is not None and 'SummaryWriter' in globals():
             self.writer = SummaryWriter(log_dir=args.log_dir)
@@ -371,10 +723,10 @@ class Train:
         self.model, config = self.build_model(args)
         config.update({ 'model': args.model, 'param': args.param })
 
-        self.init_model_weights()
+        self.init_model_weights(args)
 
         if self.verbose:
-            self.log_model_stats("post_init")
+            self.log_model_init_stats("post_init")
         
         if args.init_param != '':
             init_param = Path(args.init_param)
@@ -385,30 +737,33 @@ class Train:
                 p = p['model_state_dict']
             self.model.load_state_dict(p)
             if self.verbose:
-                self.log_model_stats("post_load")
+                self.log_model_init_stats("post_load")
 
         if args.gpu >= 0:
             self.model.to(torch.device("cuda", args.gpu))
         self.optimizer = self.build_optimizer(args.optimizer, self.model, args.lr, args.l2_weight, args)
-        self.scheduler = None
-        if args.lr_scheduler == "cosine":
-            self.scheduler = CosineAnnealingLR(
-                self.optimizer,
-                T_max=args.epochs - warmup_epochs,
-                eta_min=args.lr_min,
-            )
         self.loss_fn = self.build_loss_function(args.loss_func, self.model, args)
 
         checkpoint_epoch = 0
         if args.resume is not None:
             checkpoint_epoch = self.resume_checkpoint(args.resume)
 
+        """
+        freeze_head_epochs = 10
+        if checkpoint_epoch < freeze_head_epochs:
+            self.freeze_heads()
+        else:
+            self.unfreeze_heads()
+        """
+
         for epoch in range(checkpoint_epoch + 1, args.epochs + 1):
-            self.train(epoch, args.lr, args.lr_min)
+            """
+            if epoch == freeze_head_epochs + 1:
+                self.unfreeze_heads()
+            """
+            self.train(epoch, args.lr)
             if self.test_loader is not None:
                 self.test(epoch)
-            if self.scheduler is not None and epoch > warmup_epochs:
-                self.scheduler.step()
             if args.log_dir is not None:
                 self.save_checkpoint(args.log_dir, epoch)
 
@@ -422,21 +777,26 @@ class Train:
 
         return self.model
     
-    def init_model_weights(self):
+    def init_model_weights(self, args):
         # CHANGE: weight initialisation
-        self.model.apply(init_weights)
+        model = self._resolve_zuker_model(self.model)
+        if model is None:
+            return
 
-        self.model.net.fc_paired.apply(init_heads)
-        self.model.net.premsa.apply(init_heads)
+        model.apply(init_weights)
 
-        if self.model.net.fc_unpaired is not None:
-            self.model.net.fc_unpaired.apply(init_heads)
+        model.net.fc_paired.apply(init_heads)
+        model.net.premsa.apply(init_heads)
 
-        if hasattr(self.model, 'fc_length'):
-            for key in self.model.fc_length:
-                self.model.fc_length[key].apply(init_heads)
+        if model.net.fc_unpaired is not None:
+            model.net.fc_unpaired.apply(init_heads)
+
+        if hasattr(model, 'fc_length'):
+            for key in model.fc_length:
+                model.fc_length[key].apply(init_heads)
 
 
+    #TODO: Replace command line arguments with yaml file
     @classmethod
     def add_args(cls, parser):
         subparser = parser.add_parser('train', help='training')
@@ -467,7 +827,6 @@ class Train:
                             help='disable the progress bar in training')
         subparser.add_argument('--verbose', action='store_true',
                             help='enable verbose outputs for debugging')
-
         gparser = subparser.add_argument_group("Optimizer setting")
         gparser.add_argument('--optimizer', choices=('Adam', 'AdamW', 'RMSprop', 'SGD', 'ASGD'), default='AdamW')
         gparser.add_argument('--l1-weight', type=float, default=0.,
@@ -482,10 +841,10 @@ class Train:
                             help='learning-rate multiplier for Evoformer parameters (default: 1.0)')
         gparser.add_argument('--head-lr-mult', type=float, default=0.01,
                             help='learning-rate multiplier for scoring head parameters (default: 1.0)')
-        gparser.add_argument('--lr-scheduler', choices=('none', 'cosine'), default='none',
-                            help='learning rate scheduler (default: none)')
-        gparser.add_argument('--lr-min', type=float, default=1e-4,
-                            help='minimum learning rate for cosine scheduler (default: 1e-4)')
+        gparser.add_argument('--max-head-grad-norm', type=float, default=10,
+                            help='max gradient norm for head clipping (default: 1.0)')
+        gparser.add_argument('--max-evoformer-grad-norm', type=float, default=1.0,
+                            help='max gradient norm for evoformer clipping (default: 1.0)')
         gparser.add_argument('--loss-func', choices=('hinge', 'hinge_mix'), default='hinge',
                             help="loss fuction ('hinge', 'hinge_mix') ")
         gparser.add_argument('--loss-pos-paired', type=float, default=0.5,

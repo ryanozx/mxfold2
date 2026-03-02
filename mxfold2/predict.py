@@ -138,16 +138,16 @@ class Predict:
         }
 
         if args.model == 'Zuker':
-            model = ZukerFold(model_type='M', **config)
+            model = ZukerFold(model_type=ZukerFold.ZukerType.M, **config)
 
         elif args.model == 'ZukerC':
-            model = ZukerFold(model_type='C', **config)
+            model = ZukerFold(model_type=ZukerFold.ZukerType.C, **config)
 
         elif args.model == 'ZukerL':
-            model = ZukerFold(model_type='L', **config)
+            model = ZukerFold(model_type=ZukerFold.ZukerType.L, **config)
 
         elif args.model == 'ZukerS':
-            model = ZukerFold(model_type='S', **config)
+            model = ZukerFold(model_type=ZukerFold.ZukerType.S, **config)
 
         elif args.model == 'Mix':
             from . import param_turner2004
@@ -155,7 +155,7 @@ class Predict:
 
         elif args.model == 'MixC':
             from . import param_turner2004
-            model = MixedFold(init_param=param_turner2004, model_type='C', **config)
+            model = MixedFold(init_param=param_turner2004, model_type=ZukerFold.ZukerType.C, **config)
 
         else:
             raise('not implemented')

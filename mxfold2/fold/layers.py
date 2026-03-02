@@ -184,17 +184,19 @@ class PairedLayer(nn.Module):
         for n_conv_out, kernel_size in zip(filters, ksize):
             self.conv.append(
                 nn.Sequential( 
+                    nn.GroupNorm(num_groups = 1, num_channels = n_in),
                     nn.Conv2d(in_channels = n_in, out_channels = n_conv_out, kernel_size = kernel_size, padding=kernel_size//2), 
-                    nn.GroupNorm(num_groups = 1, num_channels = n_conv_out),
                     nn.CELU(), 
                     nn.Dropout(p=dropout_rate) ) )
             n_in = n_conv_out
 
+        self.group_norm = nn.GroupNorm(num_groups = 1, num_channels = n_in)
+
         fc = []
         for n_fc_out in fc_layers:
             fc += [
+                nn.LayerNorm(n_in),
                 nn.Linear(n_in, n_fc_out), 
-                nn.LayerNorm(n_fc_out),
                 nn.CELU(), 
                 nn.Dropout(p=dropout_rate) ]
             n_in = n_fc_out
@@ -221,6 +223,8 @@ class PairedLayer(nn.Module):
             x = x + x_a if self.enable_resnet and x.shape[1]==x_a.shape[1] else x_a # (B*2, n_last_conv_out, N, N)
             # seems like it could be possible to enable residual connections only for certain layers of conv (i.e. not all or none)
 
+        x = self.group_norm(x)
+
         # combine triangles together by masking and summing
         x_u, x_l = torch.split(x, B, dim=0) # (B, n_last_conv_out, N, N) * 2
         x_u = torch.triu(x_u.view(B, -1, N, N), diagonal=diag)
@@ -246,17 +250,19 @@ class UnpairedLayer(nn.Module):
         for n_conv_out, kernel_size in zip(filters, ksize):
             self.conv.append(
                 nn.Sequential(
+                    nn.GroupNorm(1, n_in),
                     nn.Conv1d(in_channels = n_in, out_channels = n_conv_out, kernel_size = kernel_size, padding = kernel_size // 2), 
-                    nn.GroupNorm(1, n_conv_out),
                     nn.CELU(), 
                     nn.Dropout(p = dropout_rate) ) )
             n_in = n_conv_out
 
+        self.group_norm = nn.GroupNorm(1, n_in)
+
         fc = []
         for n_fc_out in fc_layers:
             fc += [
+                nn.LayerNorm(n_in),
                 nn.Linear(in_features = n_in, out_features = n_fc_out), 
-                nn.LayerNorm(n_fc_out),
                 nn.CELU(), 
                 nn.Dropout(p = dropout_rate)]
             n_in = n_fc_out
@@ -275,7 +281,9 @@ class UnpairedLayer(nn.Module):
 
         for conv in self.conv:
             x_a = conv(x)
-            x = x + x_a if self.resnet and x.shape[1]==x_a.shape[1] else x_a
+            x = x + x_a if self.enable_resnet and x.shape[1]==x_a.shape[1] else x_a
+
+        x = self.group_norm(x)
 
         x = x.transpose(1, 2).view(B*N, -1) # (B * N, n_last_conv_out)
         x = self.fc(x)
@@ -547,13 +555,13 @@ def init_weights(m):
     if hasattr(m, 'is_residual_output') and m.is_residual_output:
         inner = getattr(m, 'linear', None)
         if isinstance(inner, torch.nn.Linear):
-            nn.init.constant_(inner.weight, 0)
+            nn.init.zeros_(inner.weight)
             if inner.bias is not None:
                 nn.init.zeros_(inner.bias)
             return
     if isinstance(m, (torch.nn.Linear, torch.nn.Conv1d, torch.nn.Conv2d)):
         if hasattr(m, 'is_residual_output') and m.is_residual_output:
-            nn.init.constant_(m.weight, 0)
+            nn.init.zeros_(m.weight)
         else:
             torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity="leaky_relu")
         if m.bias is not None:
@@ -564,6 +572,11 @@ def init_weights(m):
 
 def init_heads(m):
     if isinstance(m, nn.Linear):
-        nn.init.normal_(m.weight, std=0.001)
+        nn.init.normal_(m.weight, std=0.1)
         if m.bias is not None:
             nn.init.constant_(m.bias, 0)
+    elif isinstance(m, (torch.nn.Conv1d, torch.nn.Conv2d)):
+        with torch.no_grad():
+            m.weight.mul_(0.01)
+            if m.bias is not None:
+                m.bias.zero_()

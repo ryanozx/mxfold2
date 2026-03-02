@@ -5,7 +5,7 @@ from .rnafold import RNAFold
 from .zuker import ZukerFold
 
 class MixedFold(AbstractFold):
-    def __init__(self, init_param=None, model_type='M', max_helix_length=30, **kwargs):
+    def __init__(self, init_param=None, model_type: ZukerFold.ZukerType = ZukerFold.ZukerType.M, max_helix_length=30, **kwargs):
         super(MixedFold, self).__init__(interface.predict_mxfold, interface.partfunc_mxfold)
         self.turner = RNAFold(init_param=init_param)
         self.zuker = ZukerFold(model_type=model_type, max_helix_length=max_helix_length, **kwargs)

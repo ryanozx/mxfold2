@@ -1,41 +1,43 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from enum import Enum
+import math
 
 from .. import interface
 from .fold import AbstractFold
-from .layers import LengthLayer, EvoformerNet, NeuralNet
+from .layers import LengthLayer, EvoformerNet
 
 
 class ZukerFold(AbstractFold):
-    def __init__(self, model_type="M", max_helix_length=30, **kwargs):
+    class ZukerType(Enum):
+        S = 1
+        M = 2
+        L = 3
+        C = 4
+
+    def __init__(self, model_type: ZukerType=ZukerType.M, max_helix_length=30, **kwargs):
         super(ZukerFold, self).__init__(interface.predict_zuker, interface.partfunc_zuker)
 
         exclude_diag = True
-        if model_type == "S":
-            n_out_paired_layers = 1
-            n_out_unpaired_layers = 1
-        elif model_type == "M":
-            n_out_paired_layers = 2
-            n_out_unpaired_layers = 1
-        elif model_type == "L":
-            n_out_paired_layers = 5
-            n_out_unpaired_layers = 4
-        elif model_type == "C":
-            n_out_paired_layers = 3
-            n_out_unpaired_layers = 0
-            exclude_diag = False
-        else:
-            raise("not implemented")
+
+        match model_type:
+            case ZukerFold.ZukerType.S:
+                n_out_paired_layers = 1
+                n_out_unpaired_layers = 1
+            case ZukerFold.ZukerType.M:
+                n_out_paired_layers = 2
+                n_out_unpaired_layers = 1
+            case ZukerFold.ZukerType.L:
+                n_out_paired_layers = 5
+                n_out_unpaired_layers = 4
+            case ZukerFold.ZukerType.C:
+                n_out_paired_layers = 3
+                n_out_unpaired_layers = 0
+                exclude_diag = False
 
         self.model_type = model_type
         self.max_helix_length = max_helix_length
-        """
-        self.net = NeuralNet(**kwargs, 
-            n_out_paired_layers=n_out_paired_layers,
-            n_out_unpaired_layers=n_out_unpaired_layers,
-            exclude_diag=exclude_diag)
-        """
         
         self.net = EvoformerNet(
             seq_input_dim = 6, 
@@ -44,6 +46,9 @@ class ZukerFold(AbstractFold):
             pair_embed_dim = 64,
             n_out_paired_layers=n_out_paired_layers,
             n_out_unpaired_layers=n_out_unpaired_layers,
+            num_paired_filters = (64, 64),
+            paired_filter_size = (5, 3),
+            num_hidden_units = (),
             exclude_diag=exclude_diag)
 
         self.fc_length = nn.ModuleDict({
@@ -65,10 +70,15 @@ class ZukerFold(AbstractFold):
         # seq has the shape (B, L, N); B = 1
         device = next(self.parameters()).device
         score_paired, score_unpaired = self.net(seq, **kwargs)
+
+        score_paired = score_paired - score_paired.mean(dim=(1, 2), keepdim = True)
+
         # score_paired has shape (B, L, L, n_out_paired_layers), while score_unpaired has shape (B, L, n_out_unpaired_layers)
         # print(f"score shapes: {score_paired.shape} {score_unpaired.shape if score_unpaired is not None else None}")
         B, N, _, _ = score_paired.shape
 
+        # TODO: Move this into monitoring
+        # goal: 
         def _stat_line(name, t):
             t_det = t.detach()
             finite = torch.isfinite(t_det)
@@ -85,29 +95,34 @@ class ZukerFold(AbstractFold):
                 t_max = float("nan")
                 t_mean = float("nan")
             print(
-                f"[stat] {name}: shape={tuple(t_det.shape)} "
-                f"dtype={t_det.dtype} min={t_min:.6g} max={t_max:.6g} "
+                f"[stat] {name}: min={t_min:.6g} max={t_max:.6g} "
                 f"mean={t_mean:.6g} nan={nan_count} inf={inf_count}"
             )
+            return t_max - t_min, t_mean
 
-        if score_paired.dim() == 4:
-            for c in range(score_paired.shape[-1]):
-                _stat_line(f"score_paired[{c}]", score_paired[:, :, :, c])
-        else:
-            _stat_line("score_paired", score_paired)
+        # TODO: cleanup this code
+        score_paired_range, score_paired_mean = _stat_line("score_paired", score_paired)
 
         if score_unpaired is not None:
-            if score_unpaired.dim() == 3:
-                for c in range(score_unpaired.shape[-1]):
-                    _stat_line(f"score_unpaired[{c}]", score_unpaired[:, :, c])
-            else:
-                _stat_line("score_unpaired", score_unpaired)
+            score_unpaired = score_unpaired - score_unpaired.mean(dim=1, keepdim = True)
+            score_unpaired_range, score_unpaired_mean = _stat_line("score_unpaired", score_unpaired)
+        else:
+            score_unpaired_range = 0.
+
+        self._score_range = (score_paired_range, score_unpaired_range)
+        self._score_mean = (score_paired_mean, score_unpaired_mean)
 
         # Normalize score_unpaired *per model_type*.
         # Contract:
         #   - For S/M/C: we need a raw per-position tensor of shape (B, N)
         #   - For L:     we need raw per-position channels of shape (B, N, 4)
-        if self.model_type in ("S", "M", "C"):
+        if self.model_type == ZukerFold.ZukerType.L:
+            # L uses 4 distinct unpaired channels.
+            if score_unpaired is None:
+                score_unpaired = torch.zeros((B, N, 4), device=device, dtype=torch.float32)
+            else:
+                score_unpaired = score_unpaired.to(device=device, dtype=torch.float32)
+        else:
             # No learned unpaired channels in C; S/M typically have exactly 1.
             if score_unpaired is None:
                 score_unpaired = torch.zeros((B, N), device=device, dtype=torch.float32)
@@ -117,16 +132,7 @@ class ZukerFold(AbstractFold):
                     score_unpaired = score_unpaired[:, :, 0]
                 score_unpaired = score_unpaired.to(device=device, dtype=torch.float32)
 
-        elif self.model_type == "L":
-            # L uses 4 distinct unpaired channels.
-            if score_unpaired is None:
-                score_unpaired = torch.zeros((B, N, 4), device=device, dtype=torch.float32)
-            else:
-                score_unpaired = score_unpaired.to(device=device, dtype=torch.float32)
-
-        else:
-            raise("not implemented")
-
+        # TODO: Read paper to find out why layers are allocated this way
         def unpair_interval(su):
             # su is expected to be (B, N) on the same device/dtype we want the result.
             su = su.view(B, 1, N)
@@ -137,59 +143,57 @@ class ZukerFold(AbstractFold):
             su = torch.bmm(torch.triu(su), tri)
             return su
 
-        if self.model_type == "S":
-            score_basepair = score_paired[:, :, :, 0] # (B, N, N)
-            score_unpaired = unpair_interval(score_unpaired.contiguous())
-            score_helix_stacking = torch.zeros((B, N, N), device=device)
-            score_mismatch_external = score_helix_stacking
-            score_mismatch_internal = score_helix_stacking
-            score_mismatch_multi = score_helix_stacking
-            score_mismatch_hairpin = score_helix_stacking
-            score_base_hairpin = score_unpaired
-            score_base_internal = score_unpaired
-            score_base_multi = score_unpaired
-            score_base_external = score_unpaired
+        match self.model_type:
+            case ZukerFold.ZukerType.S:
+                score_basepair = score_paired[:, :, :, 0] # (B, N, N)
+                score_unpaired = unpair_interval(score_unpaired.contiguous())
+                score_helix_stacking = torch.zeros((B, N, N), device=device)
+                score_mismatch_external = score_helix_stacking
+                score_mismatch_internal = score_helix_stacking
+                score_mismatch_multi = score_helix_stacking
+                score_mismatch_hairpin = score_helix_stacking
+                score_base_hairpin = score_unpaired
+                score_base_internal = score_unpaired
+                score_base_multi = score_unpaired
+                score_base_external = score_unpaired
 
-        elif self.model_type == "M":
-            score_basepair = torch.zeros((B, N, N), device=device)
-            score_helix_stacking = score_paired[:, :, :, 0] # (B, N, N)
-            score_mismatch_external = score_paired[:, :, :, 1] # (B, N, N)
-            score_mismatch_internal = score_paired[:, :, :, 1] # (B, N, N)
-            score_mismatch_multi = score_paired[:, :, :, 1] # (B, N, N)
-            score_mismatch_hairpin = score_paired[:, :, :, 1] # (B, N, N)
-            score_unpaired = unpair_interval(score_unpaired)
-            score_base_hairpin = score_unpaired
-            score_base_internal = score_unpaired
-            score_base_multi = score_unpaired
-            score_base_external = score_unpaired
+            case ZukerFold.ZukerType.M:
+                score_basepair = torch.zeros((B, N, N), device=device)
+                score_helix_stacking = score_paired[:, :, :, 0] # (B, N, N)
+                score_mismatch_external = score_paired[:, :, :, 1] # (B, N, N)
+                score_mismatch_internal = score_paired[:, :, :, 1] # (B, N, N)
+                score_mismatch_multi = score_paired[:, :, :, 1] # (B, N, N)
+                score_mismatch_hairpin = score_paired[:, :, :, 1] # (B, N, N)
+                score_unpaired = unpair_interval(score_unpaired)
+                score_base_hairpin = score_unpaired
+                score_base_internal = score_unpaired
+                score_base_multi = score_unpaired
+                score_base_external = score_unpaired
 
-        elif self.model_type == "L":
-            score_basepair = torch.zeros((B, N, N), device=device)
-            score_helix_stacking = score_paired[:, :, :, 0] # (B, N, N)
-            score_mismatch_external = score_paired[:, :, :, 1] # (B, N, N)
-            score_mismatch_internal = score_paired[:, :, :, 2] # (B, N, N)
-            score_mismatch_multi = score_paired[:, :, :, 3] # (B, N, N)
-            score_mismatch_hairpin = score_paired[:, :, :, 4] # (B, N, N)
-            score_base_hairpin = unpair_interval(score_unpaired[:, :, 0].contiguous())
-            score_base_internal = unpair_interval(score_unpaired[:, :, 1].contiguous())
-            score_base_multi = unpair_interval(score_unpaired[:, :, 2].contiguous())
-            score_base_external = unpair_interval(score_unpaired[:, :, 3].contiguous())
+            case ZukerFold.ZukerType.L:
+                score_basepair = torch.zeros((B, N, N), device=device)
+                score_helix_stacking = score_paired[:, :, :, 0] # (B, N, N)
+                score_mismatch_external = score_paired[:, :, :, 1] # (B, N, N)
+                score_mismatch_internal = score_paired[:, :, :, 2] # (B, N, N)
+                score_mismatch_multi = score_paired[:, :, :, 3] # (B, N, N)
+                score_mismatch_hairpin = score_paired[:, :, :, 4] # (B, N, N)
+                score_base_hairpin = unpair_interval(score_unpaired[:, :, 0].contiguous())
+                score_base_internal = unpair_interval(score_unpaired[:, :, 1].contiguous())
+                score_base_multi = unpair_interval(score_unpaired[:, :, 2].contiguous())
+                score_base_external = unpair_interval(score_unpaired[:, :, 3].contiguous())
 
-        elif self.model_type == 'C':
-            score_basepair = torch.zeros((B, N, N), device=device)
-            score_helix_stacking = score_paired[:, :, :, 0] # (B, N, N)
-            score_mismatch_external = score_paired[:, :, :, 1] # (B, N, N)
-            score_mismatch_internal = score_paired[:, :, :, 1] # (B, N, N)
-            score_mismatch_multi = score_paired[:, :, :, 1] # (B, N, N)
-            score_mismatch_hairpin = score_paired[:, :, :, 1] # (B, N, N)
-            score_unpaired = unpair_interval(score_unpaired.contiguous()) # (B, N, N)
-            score_base_hairpin = score_unpaired
-            score_base_internal = score_unpaired
-            score_base_multi = score_unpaired
-            score_base_external = score_unpaired
-
-        else:
-            raise("not implemented")
+            case ZukerFold.ZukerType.C:
+                score_basepair = torch.zeros((B, N, N), device=device)
+                score_helix_stacking = score_paired[:, :, :, 0] # (B, N, N)
+                score_mismatch_external = score_paired[:, :, :, 1] # (B, N, N)
+                score_mismatch_internal = score_paired[:, :, :, 1] # (B, N, N)
+                score_mismatch_multi = score_paired[:, :, :, 1] # (B, N, N)
+                score_mismatch_hairpin = score_paired[:, :, :, 1] # (B, N, N)
+                score_unpaired = unpair_interval(score_unpaired.contiguous()) # (B, N, N)
+                score_base_hairpin = score_unpaired
+                score_base_internal = score_unpaired
+                score_base_multi = score_unpaired
+                score_base_external = score_unpaired
 
         param = [ { 
             'score_basepair': score_basepair[i],

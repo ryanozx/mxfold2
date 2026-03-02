@@ -16,10 +16,13 @@ class Loss:
 
     def __str__(self):
         return f"Loss = {self.loss.item():.6g}  \
-        Energy Gap = {self.pred_score.item() - self.ref_score.item():.6g} \
+        Energy Gap = {self.calc_energy_gap():.6g} \
         Margin Loss = {self.margin_loss.item():.6g} \
         Score Loss = {self.score_loss.item():.6g} \
         L1 Loss = {self.l1_loss.item():.6g}"
+    
+    def calc_energy_gap(self):
+        return self.pred_score.item() - self.ref_score.item()
 
 class StructuredLoss(nn.Module):
     def __init__(self, model, loss_pos_paired=0, loss_neg_paired=0, loss_pos_unpaired=0, loss_neg_unpaired=0, 
@@ -41,7 +44,7 @@ class StructuredLoss(nn.Module):
                                 loss_pos_unpaired=self.loss_pos_unpaired, loss_neg_unpaired=self.loss_neg_unpaired)
         ref, ref_s, _ = self.model(seq, param=param, constraint=pairs, max_internal_length=None)
         l = torch.tensor([len(s) for s in seq], device=pred.device)
-        margin_loss = (pred - ref) / l
+        margin_loss = (pred - ref)
         sl_loss = torch.zeros_like(margin_loss)
         loss = margin_loss + sl_loss
         if self.verbose:
@@ -94,18 +97,92 @@ class StructuredLossWithTurner(nn.Module):
             self.turner = self.model.turner
         else:
             self.turner = RNAFold(param_turner2004).to(next(self.model.parameters()).device)
+        self.gap_turner_vals = {}
+        self.gap_turner_cache_hits = 0
+        self.gap_turner_cache_misses = 0
+        self.gap_turner_forward_calls = 0
+        self.gap_turner_debug_interval = 100
 
+    @staticmethod
+    def _normalize_fnames(fname, batch_size):
+        if fname is None:
+            return [None] * batch_size
+        if isinstance(fname, str):
+            return [fname]
+        if isinstance(fname, (list, tuple)):
+            out = list(fname)
+            if len(out) == batch_size:
+                return out
+            if batch_size == 1 and len(out) > 0:
+                return [out[0]]
+            return out
+        return [str(fname)]
+
+    @staticmethod
+    def _select_constraint(pairs, idx):
+        if isinstance(pairs, torch.Tensor):
+            if pairs.ndim == 0:
+                return pairs
+            return pairs[idx:idx + 1]
+        if isinstance(pairs, (list, tuple)):
+            return [pairs[idx]]
+        return pairs
 
     def forward(self, seq, pairs, fname=None) -> Loss:
         pred, pred_s, _, param = self.model(seq, return_param=True, reference=pairs,
                                 loss_pos_paired=self.loss_pos_paired, loss_neg_paired=self.loss_neg_paired, 
                                 loss_pos_unpaired=self.loss_pos_unpaired, loss_neg_unpaired=self.loss_neg_unpaired)
+        mix_free, _, _ = self.model(seq, param=param, constraint=None, reference=None)
         ref, ref_s, _ = self.model(seq, param=param, constraint=pairs, max_internal_length=None)
+        gap_mix = (ref - mix_free)
+        
         with torch.no_grad():
-            ref2, ref2_s, _ = self.turner(seq, constraint=pairs, max_internal_length=None)
+            fnames = self._normalize_fnames(fname, len(seq))
+            gap_turner_list = []
+            batch_hits = 0
+            batch_misses = 0
+            for i, seq_i in enumerate(seq):
+                cache_key = fnames[i] if i < len(fnames) else None
+                cached_val = self.gap_turner_vals.get(cache_key) if cache_key is not None else None
+
+                if cached_val is None:
+                    batch_misses += 1
+                    self.gap_turner_cache_misses += 1
+                    seq_batch = [seq_i]
+                    pair_batch = self._select_constraint(pairs, i)
+                    ref2_i, _, _ = self.turner(seq_batch, constraint=pair_batch, max_internal_length=None)
+                    turner_free_i, _, _ = self.turner(seq_batch, constraint=None, max_internal_length=None)
+                    gap_i = (ref2_i - turner_free_i).reshape(-1)[0]
+                    if cache_key is not None:
+                        self.gap_turner_vals[cache_key] = float(gap_i.item())
+                    gap_turner_list.append(gap_i.to(device=pred.device, dtype=pred.dtype))
+                else:
+                    batch_hits += 1
+                    self.gap_turner_cache_hits += 1
+                    gap_turner_list.append(pred.new_tensor(cached_val))
+            gap_turner = torch.stack(gap_turner_list)
+            self.gap_turner_forward_calls += 1
+            if (
+                self.verbose
+                and self.gap_turner_debug_interval > 0
+                and self.gap_turner_forward_calls % self.gap_turner_debug_interval == 0
+            ):
+                total = self.gap_turner_cache_hits + self.gap_turner_cache_misses
+                hit_rate = (self.gap_turner_cache_hits / total) if total > 0 else 0.0
+                print(
+                    "[gap_turner_cache] "
+                    f"calls={self.gap_turner_forward_calls} "
+                    f"batch_hits={batch_hits} batch_misses={batch_misses} "
+                    f"total_hits={self.gap_turner_cache_hits} total_misses={self.gap_turner_cache_misses} "
+                    f"hit_rate={hit_rate:.3f} cache_size={len(self.gap_turner_vals)}"
+                )
+
+
+
         l = torch.tensor([len(s) for s in seq], device=pred.device)
-        margin_loss = (pred - ref) / l  
-        sl_loss = self.sl_weight * (ref-ref2) * (ref-ref2) / l
+        margin_loss = (pred - ref) 
+        criterion_loss = torch.nn.HuberLoss(delta=0.1)
+        sl_loss = self.sl_weight * criterion_loss(gap_mix, gap_turner)
 
         loss = margin_loss + sl_loss
 
@@ -133,6 +210,7 @@ class StructuredLossWithTurner(nn.Module):
         #     l2_loss += self.l2_weight * torch.sqrt(l2_reg)
 
         loss += l1_loss
+
         return Loss(
             loss = loss,
             margin_loss = margin_loss,
