@@ -1,7 +1,9 @@
 from itertools import groupby
+from pathlib import Path
 from torch.utils.data import Dataset
 import torch
 import math
+import numpy as np
 
 class FastaDataset(Dataset):
     def __init__(self, fasta):
@@ -34,10 +36,11 @@ class FastaDataset(Dataset):
 class BPseqDataset(Dataset):
     """
     Given a .lst file containing the locations of .bpseq files, BPseqDataset creates a dataset that contains
-    (filename, sequence, pairing_tensor) tuples
+    (filename, sequence, pairing_tensor, bpp_tensor) tuples
     """
-    def __init__(self, bpseq_list):
+    def __init__(self, bpseq_list, bpp_dir=None):
         self.data = []
+        self.bpp_dir = None if bpp_dir in (None, '') else Path(bpp_dir)
         with open(bpseq_list) as list_file:
             for file_entry in list_file:
                 file_entry = file_entry.rstrip('\n').split()
@@ -53,6 +56,27 @@ class BPseqDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.data[idx]
+
+    def _load_bpp(self, filename, seq_len: int):
+        if self.bpp_dir is None:
+            return torch.tensor([], dtype=torch.float32)
+
+        bpp_path = self.bpp_dir / f"{Path(filename).stem}.bpp"
+        if not bpp_path.exists():
+            raise FileNotFoundError(f"Missing BPP target for {filename}: expected {bpp_path}")
+
+        bpp = np.loadtxt(bpp_path, dtype=np.float32)
+        if bpp.ndim == 0:
+            bpp = np.array([[float(bpp)]], dtype=np.float32)
+        elif bpp.ndim == 1:
+            bpp = np.expand_dims(bpp, axis=0)
+
+        if bpp.shape != (seq_len + 1, seq_len + 1):
+            raise ValueError(
+                f"BPP target shape mismatch for {filename}: got {tuple(bpp.shape)} expected {(seq_len + 1, seq_len + 1)}"
+            )
+
+        return torch.from_numpy(bpp)
 
     def read(self, filename):
         with open(filename) as bpseq_file:
@@ -92,11 +116,11 @@ class BPseqDataset(Dataset):
         
         if is_structure_known:
             seq = ''.join(bases)
-            return (filename, seq, torch.tensor(base_pairs))
+            return (filename, seq, torch.tensor(base_pairs), self._load_bpp(filename, len(seq)))
         else:
             seq = ''.join(bases)
             base_pairs.pop(0)
-            return (filename, seq, torch.tensor(base_pairs))
+            return (filename, seq, torch.tensor(base_pairs), self._load_bpp(filename, len(seq)))
 
     def fasta_iter(self, fasta_name):
         fh = open(fasta_name)
@@ -122,4 +146,4 @@ class BPseqDataset(Dataset):
                 if len(l) == 2 and l[0].isdecimal() and l[1].isdecimal():
                     p.append([int(l[0]), int(l[1])])
 
-        return (h, seq, torch.tensor(p))
+        return (h, seq, torch.tensor(p), self._load_bpp(seq_filename, len(seq)))

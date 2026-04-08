@@ -16,7 +16,7 @@ auto
 convert_constraints(py::list constraint)
 {
     std::vector<uint32_t> ret(constraint.size(), Fold::Options::ANY);
-    for (auto i=0; i!=constraint.size(); i++)
+    for (uint32_t i=0; i!=constraint.size(); i++)
     {
         if (py::isinstance<py::str>(constraint[i]))
         {
@@ -55,6 +55,7 @@ auto
 convert_pairs(py::list pairs)
 {
     std::vector<std::pair<uint32_t, uint32_t>> ret;
+    ret.reserve(pairs.size());
     for (auto pair: pairs)
     {
         if (py::isinstance<py::list>(pair))
@@ -120,8 +121,10 @@ auto predict_zuker(const std::string& seq, py::object pa,
 
     auto param = std::make_unique<ParamClass>(seq, pa);
     Zuker<ParamClass> f(std::move(param));
-    f.compute_viterbi(seq, options);
-    auto [e, p] = f.traceback_viterbi(seq, options);
+    const auto L = seq.size();
+    const auto [loss_paired, loss_unpaired, loss_const] = options.make_penalty(L);
+    f.compute_viterbi(seq, loss_paired, loss_unpaired, loss_const, options);
+    auto [e, p] = f.traceback_viterbi(seq, loss_paired, loss_unpaired, loss_const, options);
     auto s = Zuker<ParamClass>::make_paren(p);
     return std::make_tuple(e, s, p);
 }
@@ -164,8 +167,8 @@ auto partfunc_zuker(const std::string& seq, py::object pa,
     auto bpp = f.compute_basepairing_probabilities(seq, options);
     py::array_t<float> bpp_a({bpp.size(), bpp[0].size()});
     auto bpp_a2 = bpp_a.mutable_unchecked<2>();
-    for (auto i=0; i<bpp.size(); i++)
-        for (auto j=0; j<bpp[i].size(); j++)
+    for (uint32_t i=0; i<bpp.size(); i++)
+        for (uint32_t j=0; j<bpp[i].size(); j++)
             bpp_a2(i, j) = bpp[i][j];
     return std::make_pair(ret, bpp_a);
 }

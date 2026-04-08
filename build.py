@@ -15,7 +15,8 @@ ext_modules = [
             "mxfold2/src/fold/zuker.cpp", #fold/zuker.h 
             "mxfold2/src/fold/nussinov.cpp", #fold/nussinov.h 
             #"mxfold2/src/fold/trimatrix.h
-        ]
+        ],
+        extra_compile_args = ["-march=native", "-flto", "-O3"]
     )
 ]
 

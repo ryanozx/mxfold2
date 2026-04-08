@@ -166,3 +166,6 @@ poetry.lock
 models
 
 *.slurmlog
+
+*.csv
+*.png

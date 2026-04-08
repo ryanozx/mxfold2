@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import time
 from enum import Enum
-import math
 
 from .. import interface
 from .fold import AbstractFold
-from .layers import LengthLayer, EvoformerNet
+from .layers import LengthLayer, NeuralNet
 
 
 class ZukerFold(AbstractFold):
@@ -39,16 +39,9 @@ class ZukerFold(AbstractFold):
         self.model_type = model_type
         self.max_helix_length = max_helix_length
         
-        self.net = EvoformerNet(
-            seq_input_dim = 6, 
-            msa_input_dim = 6 + 1,
-            seq_embed_dim = 64,
-            pair_embed_dim = 64,
+        self.net = NeuralNet(**kwargs, 
             n_out_paired_layers=n_out_paired_layers,
             n_out_unpaired_layers=n_out_unpaired_layers,
-            num_paired_filters = (64, 64),
-            paired_filter_size = (5, 3),
-            num_hidden_units = (),
             exclude_diag=exclude_diag)
 
         self.fc_length = nn.ModuleDict({
@@ -66,10 +59,19 @@ class ZukerFold(AbstractFold):
         return super(ZukerFold, self).forward(seq, max_helix_length=self.max_helix_length, **kwargs)
 
 
-    def make_param(self, seq, **kwargs):
+    def make_param(self, seq, return_aux: bool = False, **kwargs):
         # seq has the shape (B, L, N); B = 1
+        start = time.perf_counter()
         device = next(self.parameters()).device
-        score_paired, score_unpaired = self.net(seq, **kwargs)
+        sinkhorn_aux = {}
+        if return_aux:
+            score_paired, score_unpaired, sinkhorn_mask = self.net(seq, return_sinkhorn_mask=True, **kwargs)
+            sinkhorn_aux["sinkhorn_mask"] = sinkhorn_mask
+            sinkhorn_layer = getattr(self.net, "sparse_sinkhorn", None)
+            sinkhorn_aux["sinkhorn_block_size"] = getattr(sinkhorn_layer, "block_size", None)
+            sinkhorn_aux["sinkhorn_block_mask_with_slack"] = None if sinkhorn_layer is None else getattr(sinkhorn_layer, "_last_block_mask_with_slack_live", None)
+        else:
+            score_paired, score_unpaired = self.net(seq, **kwargs)
 
         score_paired = score_paired - score_paired.mean(dim=(1, 2), keepdim = True)
 
@@ -79,12 +81,10 @@ class ZukerFold(AbstractFold):
 
         # TODO: Move this into monitoring
         # goal: 
-        def _stat_line(name, t):
+        def _stat_line(t):
             t_det = t.detach()
             finite = torch.isfinite(t_det)
             finite_count = int(finite.sum().item())
-            nan_count = int(torch.isnan(t_det).sum().item())
-            inf_count = int(torch.isinf(t_det).sum().item())
             if finite_count > 0:
                 t_f = t_det[finite]
                 t_min = float(t_f.min().item())
@@ -94,20 +94,17 @@ class ZukerFold(AbstractFold):
                 t_min = float("nan")
                 t_max = float("nan")
                 t_mean = float("nan")
-            print(
-                f"[stat] {name}: min={t_min:.6g} max={t_max:.6g} "
-                f"mean={t_mean:.6g} nan={nan_count} inf={inf_count}"
-            )
             return t_max - t_min, t_mean
 
         # TODO: cleanup this code
-        score_paired_range, score_paired_mean = _stat_line("score_paired", score_paired)
+        score_paired_range, score_paired_mean = _stat_line(score_paired)
 
         if score_unpaired is not None:
             score_unpaired = score_unpaired - score_unpaired.mean(dim=1, keepdim = True)
-            score_unpaired_range, score_unpaired_mean = _stat_line("score_unpaired", score_unpaired)
+            score_unpaired_range, score_unpaired_mean = _stat_line(score_unpaired)
         else:
             score_unpaired_range = 0.
+            score_unpaired_mean = None
 
         self._score_range = (score_paired_range, score_unpaired_range)
         self._score_mean = (score_paired_mean, score_unpaired_mean)
@@ -215,4 +212,7 @@ class ZukerFold(AbstractFold):
             'score_helix_length': self.fc_length['score_helix_length'].make_param()
         } for i in range(B) ]
 
+        self._last_make_param_timing = time.perf_counter() - start
+        if return_aux:
+            return param, sinkhorn_aux
         return param

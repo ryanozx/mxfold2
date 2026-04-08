@@ -26,7 +26,7 @@ class PositionalBasePairScore
 
     private:
         ParamType<2> score_paired_;
-        ParamType<1> score_unpaired_;
         CountType<2> count_paired_;
+        ParamType<1> score_unpaired_;
         CountType<1> count_unpaired_;
 };

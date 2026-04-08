@@ -185,7 +185,7 @@ PositionalNearestNeighbor::
 score_helix(size_t i, size_t j, size_t m) const -> ScoreType
 {
     auto e = ScoreType(0.);
-    for (auto k=1; k<m; k++)
+    for (uint32_t k=1; k<m; k++)
     {
         e += score_helix_stacking_(i+(k-1), j-(k-1));
         e += score_helix_stacking_(j-k, i+k);
@@ -199,7 +199,7 @@ void
 PositionalNearestNeighbor::
 count_helix(size_t i, size_t j, size_t m, ScoreType v)
 {
-    for (auto k=1; k<m; k++)
+    for (uint32_t k=1; k<m; k++)
     {
         count_helix_stacking_(i+(k-1), j-(k-1)) += v;
         count_helix_stacking_(j-k, i+k) += v;

@@ -427,7 +427,7 @@ TurnerNearestNeighbor::
 score_helix(size_t i, size_t j, size_t m) const -> ScoreType
 {
     auto e = ScoreType(0.);
-    for (auto k=1; k<m; k++)
+    for (uint32_t k=1; k<m; k++)
     {
         const auto type1 = complement_pair[seq2_[i+(k-1)]][seq2_[j-(k-1)]];
         const auto type2 = complement_pair[seq2_[j-k]][seq2_[i+k]];
@@ -440,8 +440,8 @@ void
 TurnerNearestNeighbor::
 count_helix(size_t i, size_t j, size_t m, ScoreType v)
 {
-    auto e = ScoreType(0.);
-    for (auto k=1; k<m; k++)
+    // auto e = ScoreType(0.);
+    for (uint32_t k=1; k<m; k++)
     {
         const auto type1 = complement_pair[seq2_[i+(k-1)]][seq2_[j-(k-1)]];
         const auto type2 = complement_pair[seq2_[j-k]][seq2_[i+k]];

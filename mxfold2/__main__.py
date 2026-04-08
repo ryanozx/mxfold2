@@ -2,6 +2,7 @@ import os
 import sys
 from argparse import ArgumentParser
 
+from .pair_fusion_cli import PairFusionCLI
 from .predict import Predict
 from .train import Train
 #from .show_param import ShowParam
@@ -17,6 +18,7 @@ def main():
     parser.set_defaults(func = lambda args, conf: parser.print_help())
     Train.add_args(subparser)
     Predict.add_args(subparser)
+    PairFusionCLI.add_args(subparser)
     # ShowParam.add_args(subparser)
     args = parser.parse_args()
 

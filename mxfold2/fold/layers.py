@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from .embedding import OneHotEmbedding, SparseEmbedding
+from .sparse_sinkhorn import SparseSinkhornLayer
 from .transformer import TransformerLayer
 from .EvoFormer.PreMSA import PreMSA
 from .EvoFormer.EvoFormer import EvoformerStack
@@ -84,6 +85,7 @@ class CNNLSTMEncoder(nn.Module):
 
         if enable_lstm:
             assert num_lstm_units > 0
+            # self.pre_lstm_ln = nn.LayerNorm(n_in)
             self.lstm = nn.LSTM(input_size = n_in, hidden_size = num_lstm_units, num_layers=num_lstm_layers, batch_first=True, bidirectional=True, 
                             dropout = dropout_rate if num_lstm_layers>1 else 0)
             self.n_out = n_in = num_lstm_units * 2
@@ -108,7 +110,9 @@ class CNNLSTMEncoder(nn.Module):
         x = torch.transpose(x, 1, 2) # (B, N, conv_C)
 
         if self.lstm is not None:
-            x_a, _ = self.lstm(x) # (B, N, n_lstm_out = num_lstm_units * 2)
+            # x = self.pre_lstm_ln(x)
+            with torch.backends.cudnn.flags(enabled=False):
+                x_a, _ = self.lstm(x) # (B, N, n_lstm_out = num_lstm_units * 2)
             x_a = self.lstm_ln(x_a)
             x_a = self.dropout(F.celu(x_a)) # (B, N, n_lstm_out)
             x = x + x_a if self.enable_resnet and x.shape[2]==x_a.shape[2] else x_a # resnet occurs only if n_in == 2 * num_lstm_units
@@ -132,6 +136,10 @@ JOIN_MAP = {
     "add": JoinType.ADD,
     "mul": JoinType.MUL,
     "bilinear": JoinType.BILINEAR,
+    "JoinType.CAT": JoinType.CAT,
+    "JoinType.ADD": JoinType.ADD,
+    "JoinType.MUL": JoinType.MUL,
+    "JoinType.BILINEAR": JoinType.BILINEAR,
 }
 
 class Transform2D(nn.Module):
@@ -184,19 +192,19 @@ class PairedLayer(nn.Module):
         for n_conv_out, kernel_size in zip(filters, ksize):
             self.conv.append(
                 nn.Sequential( 
-                    nn.GroupNorm(num_groups = 1, num_channels = n_in),
                     nn.Conv2d(in_channels = n_in, out_channels = n_conv_out, kernel_size = kernel_size, padding=kernel_size//2), 
+                    nn.GroupNorm(num_groups = 1, num_channels = n_conv_out),
                     nn.CELU(), 
                     nn.Dropout(p=dropout_rate) ) )
             n_in = n_conv_out
 
-        self.group_norm = nn.GroupNorm(num_groups = 1, num_channels = n_in)
+        # self.group_norm = nn.GroupNorm(num_groups = 1, num_channels = n_in)
 
         fc = []
         for n_fc_out in fc_layers:
             fc += [
-                nn.LayerNorm(n_in),
                 nn.Linear(n_in, n_fc_out), 
+                nn.LayerNorm(n_fc_out),
                 nn.CELU(), 
                 nn.Dropout(p=dropout_rate) ]
             n_in = n_fc_out
@@ -223,7 +231,7 @@ class PairedLayer(nn.Module):
             x = x + x_a if self.enable_resnet and x.shape[1]==x_a.shape[1] else x_a # (B*2, n_last_conv_out, N, N)
             # seems like it could be possible to enable residual connections only for certain layers of conv (i.e. not all or none)
 
-        x = self.group_norm(x)
+        # x = self.group_norm(x)
 
         # combine triangles together by masking and summing
         x_u, x_l = torch.split(x, B, dim=0) # (B, n_last_conv_out, N, N) * 2
@@ -331,7 +339,14 @@ class NeuralNet(nn.Module):
             pair_join: JoinType = JoinType.CAT,
             num_paired_filters: tuple[int] = (), paired_filter_size: tuple[int] = (),
             num_hidden_units: tuple[int] = (32,), dropout_rate: float = 0.0, fc_dropout_rate: float = 0.0, 
-            exclude_diag: bool = True, n_out_paired_layers: int =0, n_out_unpaired_layers: int = 0):
+            exclude_diag: bool = True, n_out_paired_layers: int = 0, n_out_unpaired_layers: int = 0,
+            use_sparse_sinkhorn: bool = False, num_sinkhorn_iterations: int = 10, sinkhorn_temp: float = 0.1,
+            sinkhorn_block_size: int = 30, sinkhorn_alpha: float = 0.5,
+            sinkhorn_temp_length_center: float = 8.0, sinkhorn_temp_length_slope: float = 3.0,
+            sinkhorn_pooling: str = "attention", sinkhorn_gating: str = "residual",
+            sinkhorn_diag_logit_penalty: float = 0.0,
+            sinkhorn_use_slack: bool = False,
+            sinkhorn_real_only_normalization: bool = False):
 
         super(NeuralNet, self).__init__()
 
@@ -349,6 +364,28 @@ class NeuralNet(nn.Module):
                             n_hidden = num_transformer_hidden_units, 
                             n_layers = num_transformer_layers, dropout = dropout_rate)
             
+        self.use_sparse_sinkhorn = use_sparse_sinkhorn
+        self.sinkhorn_gating = str(sinkhorn_gating).lower()
+        self._last_sinkhorn_mask = None
+        if self.sinkhorn_gating not in {"residual", "multiplicative"}:
+            raise ValueError(f"Unknown sinkhorn_gating mode: {sinkhorn_gating}")
+        if use_sparse_sinkhorn and self.pair_join == JoinType.BILINEAR:
+            raise ValueError("Sparse Sinkhorn gating is not supported with bilinear pair joins.")
+        if use_sparse_sinkhorn:
+            self.sparse_sinkhorn = SparseSinkhornLayer(
+                sinkhorn_block_size,
+                num_sinkhorn_iterations,
+                num_lstm_units * 2,
+                sinkhorn_temp,
+                sinkhorn_alpha,
+                sinkhorn_temp_length_center,
+                sinkhorn_temp_length_slope,
+                sinkhorn_pooling,
+                sinkhorn_diag_logit_penalty,
+                sinkhorn_use_slack,
+                sinkhorn_real_only_normalization,
+            )
+
         n_in = self.encoder.n_out
 
         if self.pair_join != JoinType.BILINEAR:
@@ -357,6 +394,9 @@ class NeuralNet(nn.Module):
             n_in_paired = n_in // 2 if pair_join != JoinType.CAT else n_in
             if self.no_split_lr:
                 n_in_paired *= 2
+            if self.use_sparse_sinkhorn and self.sinkhorn_gating == "residual":
+                self.sinkhorn_mask_proj = nn.Conv2d(1, n_in_paired, kernel_size=1)
+                self.sinkhorn_gate_scale = nn.Parameter(torch.tensor(1.0))
 
             self.fc_paired = PairedLayer(n_in = n_in_paired, n_out = n_out_paired_layers,
                                     filters = num_paired_filters, ksize = paired_filter_size,
@@ -375,7 +415,7 @@ class NeuralNet(nn.Module):
             self.linear = nn.Linear(n_in, n_out_unpaired_layers)
 
 
-    def forward(self, seq, **kwargs):
+    def forward(self, seq, return_sinkhorn_mask: bool = False, **kwargs):
         """
         seq: Sequence representation of dimension (B, L, N)
         """
@@ -385,6 +425,14 @@ class NeuralNet(nn.Module):
         x = self.embedding(['0' + s for s in seq]).to(device) # (B, 4, N)
         x = self.encoder(x, **kwargs)
 
+        # TODO: there are two parallel paths at this stage:
+        # 1. transforming the 1D output of the Bi-LSTM/Transformer into a 2D map
+        # 2. generating the mask for the 2D map using sparse sinkhorn; this should take in the same 1D output sequence
+        if self.use_sparse_sinkhorn:
+            mask = self.sparse_sinkhorn(x) # (B, N, N)
+            self._last_sinkhorn_mask = mask.detach()
+        else:
+            mask = None
 
         if self.no_split_lr:
             x_l, x_r = x, x
@@ -393,8 +441,20 @@ class NeuralNet(nn.Module):
             x_r = x[:, :, 1::2]
         x_r = x_r[:, :, torch.arange(x_r.shape[-1]-1, -1, -1)] # reverse the last axis
 
-        if self.pair_join != 'bilinear':
+        if self.pair_join != JoinType.BILINEAR:
             x_lr = self.transform2d(x_l, x_r)
+
+            if self.use_sparse_sinkhorn:
+                x_lr = x_lr.permute(0, 3, 1, 2)
+                if self.sinkhorn_gating == "residual":
+                    mask_feat = self.sinkhorn_mask_proj(mask.unsqueeze(1))
+                    gate = 1.0 + self.sinkhorn_gate_scale * torch.tanh(mask_feat)
+                    spatial_eye = torch.eye(gate.shape[-1], device=gate.device, dtype=torch.bool).unsqueeze(0).unsqueeze(0)
+                    gate = torch.where(spatial_eye, torch.ones_like(gate), gate)
+                    x_lr = x_lr * gate
+                else:
+                    x_lr = x_lr * mask.unsqueeze(1)
+                x_lr = x_lr.permute(0, 2, 3, 1)
 
             score_paired = self.fc_paired(x_lr)
             if self.fc_unpaired is not None:
@@ -402,6 +462,8 @@ class NeuralNet(nn.Module):
             else:
                 score_unpaired = None
 
+            if return_sinkhorn_mask:
+                return score_paired, score_unpaired, mask
             return score_paired, score_unpaired
 
         else:
@@ -411,6 +473,8 @@ class NeuralNet(nn.Module):
             score_paired = self.bilinear(x_l, x_r).view(B, N, N, -1)
             score_unpaired = self.linear(x)
 
+            if return_sinkhorn_mask:
+                return score_paired, score_unpaired, mask
             return score_paired, score_unpaired
         
 class EvoformerNet(nn.Module):
@@ -563,7 +627,8 @@ def init_weights(m):
         if hasattr(m, 'is_residual_output') and m.is_residual_output:
             nn.init.zeros_(m.weight)
         else:
-            torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity="leaky_relu")
+            # CELU + normalization blocks do better with an activation-agnostic explicit init.
+            nn.init.xavier_uniform_(m.weight)
         if m.bias is not None:
             torch.nn.init.zeros_(m.bias)
     elif isinstance(m, (torch.nn.GroupNorm, torch.nn.LayerNorm)):
@@ -576,7 +641,6 @@ def init_heads(m):
         if m.bias is not None:
             nn.init.constant_(m.bias, 0)
     elif isinstance(m, (torch.nn.Conv1d, torch.nn.Conv2d)):
-        with torch.no_grad():
-            m.weight.mul_(0.01)
-            if m.bias is not None:
-                m.bias.zero_()
+        nn.init.normal_(m.weight, mean=0.0, std=1e-2)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)

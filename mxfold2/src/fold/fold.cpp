@@ -35,15 +35,18 @@ make_paren(const std::vector<uint32_t>& p) -> std::string
 
 auto
 Fold::Options::
-make_constraint(const std::string& seq, bool canonical_only /*=true*/) 
+make_constraint(const std::string& seq, const bool canonical_only /*=true*/) 
     -> std::pair<std::vector<std::vector<bool>>, std::vector<std::vector<bool>>>
 {
     const auto L = seq.size();
     // Normalise per-position constraint spec to 1-based indexing (0th unused)
     constraint_spec.reserve(L+1);
-    while (constraint_spec.size() <= L)
-        constraint_spec.push_back(Options::ANY);
-    constraint_spec.resize(L+1);
+
+    if (constraint_spec.size() <= L) {
+        constraint_spec.resize(L + 1, Options::ANY);
+    } else if (constraint_spec.size() > L + 1) {
+        constraint_spec.resize(L + 1);
+    }
 
     // Drop disallowed enforced pairs (non-canonical or too-short hairpin)
     for (auto i=L; i>=1; i--)
@@ -54,9 +57,9 @@ make_constraint(const std::string& seq, bool canonical_only /*=true*/)
 
     // Flag positions involved in crossing (pseudoknotted) pairs
     std::vector<bool> is_in_pseudoknot(L+1, false);
-    for (auto i=1; i<=L; i++)
+    for (uint32_t i=1; i<=L; i++)
         if (constraint_spec[i] > 0 && constraint_spec[i] <= L) // paired
-            for (auto k=i+1; k<constraint_spec[i]; k++)
+            for (uint32_t k=i+1; k<constraint_spec[i]; k++)
                 if (/*constraint_spec[k] > 0 &&*/ constraint_spec[k] <= L && constraint_spec[k] > constraint_spec[i]) // paired & is_in_pseudoknot
                     is_in_pseudoknot[i] = is_in_pseudoknot[constraint_spec[i]] = is_in_pseudoknot[k] = is_in_pseudoknot[constraint_spec[k]] = true;
 
@@ -136,7 +139,7 @@ Fold::Options::
 make_penalty(size_t L) 
     -> std::tuple<TriMatrix<float>, std::vector<std::vector<float>>, float>
 {
-    TriMatrix<float> p_paired(L+1, 0.0);
+    TriMatrix<float> p_paired(L + 1, 0.0);
     std::vector<std::vector<float>> p_unpaired(L+1, std::vector<float>(L+1, 0.0));
     float p_const = 0;
     if (use_penalty)

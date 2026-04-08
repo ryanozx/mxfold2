@@ -1,7 +1,10 @@
 #pragma once
 
 #include <vector>
+#include <algorithm>
+#include <cassert>
 
+// Creates a vector that accounts for the start offset
 template <typename T>
 class RangedVector
 {
@@ -71,3 +74,46 @@ class TriMatrix
     private:
         std::vector< RangedVector<T> > data_;
 };
+
+/**
+// Upper triangular matrix but with contiguous memory and no reallocations (assumes that max sz <= 501)
+template <typename T>
+class TriMatrixNew
+{
+    public:
+        TriMatrix() : data_(), sz_(0), offsets() {}
+
+        TriMatrix(int sz, T v = T()) : data_(sz * (sz + 1) / 2, v), sz_(0) {
+            offsets.resize(sz);
+
+            offsets[0] = 0;
+            for (uint32_t i = 0; i < sz; ++i) {
+                offsets[i + 1] = offsets[i] + (sz - i);
+            }
+        }
+
+        void resize(int sz, T v = T())
+        {
+
+            std::fill(data_.begin(), data_.end(), v);
+            sz_ = sz;
+        }
+
+        size_t size() const { return sz_; }
+
+        T& operator()(size_t i, size_t j) {
+            assert(j < sz_ && i <= j);
+            return data_[offsets[501 - sz + i] + j - i];
+        }
+
+        const T& operator()(size_t i, size_t j) const {
+            assert(j < sz_ && i <= j);
+            return data_[offsets[501 - sz + i] + j - i];
+        }
+
+    private:
+        std::vector<T> data_;
+        size_t sz_;
+        std::vector<uint32_t> offsets;
+};
+*/
